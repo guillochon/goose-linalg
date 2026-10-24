@@ -195,19 +195,86 @@ fn transpose(a) -> matrix {
     return t;
 }
 
-// a * b, in i-k-j order so the inner loop runs along rows of both.
+// a * b, in i-k-j order so the inner loop runs along rows of both. Four rows
+// of c and four rows of b at a time: each element of b loaded feeds four
+// rows of c, and each pass over a row of c folds in four rows of b.
 fn matmul(a, b) -> matrix {
     assert(a.cols == b.rows);
     let n = b.cols;
+    let kk = a.cols;
     var c = zeros(a.rows, n);
-    for i in a.rows {
-        let crow = c.data[i * n..(i + 1) * n];
-        for k in a.cols {
-            let x = a.data[i * a.cols + k];
-            let brow = b.data[k * n..(k + 1) * n];
-            assert(crow.len == n && brow.len == n);
-            for j in n { crow[j] += x * brow[j]; }
+    var i = 0;
+    while i + 4 <= a.rows {
+        let c0 = row(c, i);
+        let c1 = row(c, i + 1);
+        let c2 = row(c, i + 2);
+        let c3 = row(c, i + 3);
+        let a0 = row(a, i);
+        let a1 = row(a, i + 1);
+        let a2 = row(a, i + 2);
+        let a3 = row(a, i + 3);
+        assert(c0.len == n && c1.len == n && c2.len == n && c3.len == n);
+        assert(a0.len == kk && a1.len == kk && a2.len == kk && a3.len == kk);
+        var k = 0;
+        while k + 4 <= kk {
+            let b0 = row(b, k);
+            let b1 = row(b, k + 1);
+            let b2 = row(b, k + 2);
+            let b3 = row(b, k + 3);
+            assert(b0.len == n && b1.len == n && b2.len == n && b3.len == n);
+            let p0 = a0[k];
+            let p1 = a0[k + 1];
+            let p2 = a0[k + 2];
+            let p3 = a0[k + 3];
+            let q0 = a1[k];
+            let q1 = a1[k + 1];
+            let q2 = a1[k + 2];
+            let q3 = a1[k + 3];
+            let r0 = a2[k];
+            let r1 = a2[k + 1];
+            let r2 = a2[k + 2];
+            let r3 = a2[k + 3];
+            let s0 = a3[k];
+            let s1 = a3[k + 1];
+            let s2 = a3[k + 2];
+            let s3 = a3[k + 3];
+            for j in n {
+                let v0 = b0[j];
+                let v1 = b1[j];
+                let v2 = b2[j];
+                let v3 = b3[j];
+                c0[j] += p0 * v0 + p1 * v1 + p2 * v2 + p3 * v3;
+                c1[j] += q0 * v0 + q1 * v1 + q2 * v2 + q3 * v3;
+                c2[j] += r0 * v0 + r1 * v1 + r2 * v2 + r3 * v3;
+                c3[j] += s0 * v0 + s1 * v1 + s2 * v2 + s3 * v3;
+            }
+            k += 4;
         }
+        while k < kk {
+            let bk = row(b, k);
+            assert(bk.len == n);
+            let p = a0[k];
+            let q = a1[k];
+            let r = a2[k];
+            let s = a3[k];
+            for j in n {
+                let v = bk[j];
+                c0[j] += p * v;
+                c1[j] += q * v;
+                c2[j] += r * v;
+                c3[j] += s * v;
+            }
+            k++;
+        }
+        i += 4;
+    }
+    // The last rows, one at a time.
+    while i < a.rows {
+        let ci = row(c, i);
+        let ai = row(a, i);
+        assert(ci.len == n && ai.len == kk);
+        for k in kk { axpy(ai[k], row(b, k), ci); }
+        i++;
     }
     return c;
 }
@@ -250,10 +317,34 @@ fn power(a, k: i64) -> matrix {
 // ---------------------------------------------------------------------------
 // Vectors
 
+// The partial sums a reduction keeps. A fixed array of lanes, updated by an
+// inner loop over them, is a summation order the C compiler vectorizes as
+// written; a single running sum it may not reorder without fast-math.
+let LANES = 16;
+
 fn dot(x: f64[:], y: f64[:]) -> f64 {
-    assert(x.len == y.len);
+    let n = x.len;
+    assert(y.len == n);
+    // Short vectors don't fill the lanes: setting them up and adding them
+    // back would cost more than the loop.
+    if n < 2 * LANES {
+        var s = 0.0;
+        for i in n { s += x[i] * y[i]; }
+        return s;
+    }
+    var acc: f64[LANES] = [0.0; LANES];
+    let m = n - n % LANES;
+    var i = 0;
+    while i < m {
+        let xs = x[i..i + LANES];
+        let ys = y[i..i + LANES];
+        assert(xs.len == LANES && ys.len == LANES);
+        for k in LANES { acc[k] += xs[k] * ys[k]; }
+        i += LANES;
+    }
     var s = 0.0;
-    for v, i in x { s += v * y[i]; }
+    for k in LANES { s += acc[k]; }
+    for j in m..n { s += x[j] * y[j]; }
     return s;
 }
 
@@ -371,8 +462,7 @@ fn solve_lower(l, b: f64[:], unit_diag: bool = false) -> f64[>..] {
     for i in n {
         let li = row(l, i);
         assert(li.len == n && x.len == n);
-        var s = b[i];
-        for k in i { s -= li[k] * x[k]; }
+        let s = b[i] - dot(li[..i], x[..i]);
         x[i] = if unit_diag { s } else { s / li[i] };
     }
     return x;
@@ -388,9 +478,7 @@ fn solve_upper(u, b: f64[:]) -> f64[>..] {
         let i = n - 1 - ii;
         let ui = row(u, i);
         assert(ui.len == n && x.len == n);
-        var s = b[i];
-        for k in i + 1..n { s -= ui[k] * x[k]; }
-        x[i] = s / ui[i];
+        x[i] = (b[i] - dot(ui[i + 1..], x[i + 1..])) / ui[i];
     }
     return x;
 }
@@ -475,17 +563,34 @@ fn solve(a, b: f64[:]) -> f64[>..], bool {
     return lu_solve(lu, piv, b), true;
 }
 
-// Solves a x = b for every column of b at once.
+// Solves a x = b for every column of b at once. The substitutions work on
+// whole rows of right-hand sides: row i of x takes a multiple of each row
+// solved before it, so every inner loop runs along a row.
 fn solve_matrix(a, b) -> matrix, bool {
-    assert(a.rows == b.rows);
+    assert(a.rows == a.cols && a.rows == b.rows);
+    let n = a.rows;
+    let m = b.cols;
     var lu = clone(a);
     var piv: i64[>..] = [];
     let sign, ok = lu_factor(lu, piv);
     guard ok else { return zeros(0, 0), false; }
-    var x = zeros(a.cols, b.cols);
-    for j in b.cols {
-        let xj = lu_solve(lu, piv, col(b, j));
-        for i in xj.len { x.data[i * x.cols + j] = xj[i]; }
+    var x = zeros(n, m);
+    for i in n { set_block(x, i, 0, submatrix(b, piv[i], piv[i] + 1, 0, m)); }
+    // l y = p b: l has a unit diagonal.
+    for i in n {
+        let li = row(lu, i);
+        let xi = row(x, i);
+        for k in i { axpy(-li[k], row(x, k), xi); }
+    }
+    // u x = y, from the bottom row up.
+    for ii in n {
+        let i = n - 1 - ii;
+        let ui = row(lu, i);
+        let xi = row(x, i);
+        assert(ui.len == n);
+        for k in i + 1..n { axpy(-ui[k], row(x, k), xi); }
+        let d = ui[i];
+        for &v in xi { v /= d; }
     }
     return x, true;
 }
@@ -509,17 +614,15 @@ fn cholesky(a) -> matrix, bool {
         // Entry (i, j) is a dot product of rows i and j of l, up to column j.
         let lj = l.data[j * n..(j + 1) * n];
         assert(lj.len == n);
-        var d = a.data[j * n + j];
-        for k in j { d -= lj[k] * lj[k]; }
+        let head = lj[..j];
+        let d = a.data[j * n + j] - dot(head, head);
         if d <= 0.0 || d != d { ok = false; break; }
         let ljj = sqrt(d);
         lj[j] = ljj;
         for i in j + 1..n {
             let li = l.data[i * n..(i + 1) * n];
             assert(li.len == n);
-            var s = a.data[i * n + j];
-            for k in j { s -= li[k] * lj[k]; }
-            li[j] = s / ljj;
+            li[j] = (a.data[i * n + j] - dot(li[..j], head)) / ljj;
         }
     }
     return l, ok;
@@ -583,11 +686,7 @@ fn qr(a, q: matrix&, r: matrix&) {
         // q[.., k..] -= 2 (q[.., k..] v) v^T, accumulating q = H_1 H_2 ...
         for i in m {
             let qi = q.data[i * m + k..(i + 1) * m];
-            assert(qi.len == v.len);
-            var s = 0.0;
-            for t in qi.len { s += qi[t] * v[t]; }
-            s *= 2.0;
-            for t in qi.len { qi[t] -= s * v[t]; }
+            axpy(-2.0 * dot(qi, v), v, qi);
         }
         for i in k + 1..m { r.data[i * n + k] = 0.0; }
     }
@@ -646,83 +745,194 @@ fn rotate_rows(m: matrix&, p: i64, q: i64, c: f64, s: f64) {
     }
 }
 
-// Eigenvalues and eigenvectors of symmetric a, by cyclic Jacobi rotations:
-// a = vectors diag(values) vectors^T with values ascending and vectors
-// orthogonal, column j belonging to values[j]. Reads the whole of a, which
-// should be symmetric. Returns false if it did not converge.
+// sqrt(a^2 + b^2) without overflow or underflow on the way.
+fn hypot2(a: f64, b: f64) -> f64 {
+    let x = abs(a);
+    let y = abs(b);
+    let big = max(x, y);
+    guard big > 0.0 else { return 0.0; }
+    let small = min(x, y) / big;
+    return big * sqrt(1.0 + small * small);
+}
+
+// Eigenvalues and eigenvectors of symmetric a: a = vectors diag(values)
+// vectors^T with values ascending and vectors orthogonal, column j belonging
+// to values[j]. Reads the upper triangle of a. Returns false if the QL
+// iteration did not converge.
+//
+// Householder reduction to tridiagonal form, then the implicit QL method
+// with Wilkinson shifts: EISPACK's tred2 and tql2, by way of JAMA. Both
+// classically walk the columns of the working matrix; here it is kept
+// transposed, w[c][r] for their V[r][c], so the walks run along rows.
 fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
     assert(a.rows == a.cols);
     let n = a.rows;
+    values.clear();
+    guard n > 0 else {
+        vectors = zeros(0, 0);
+        return true;
+    }
     var w = clone(a);
-    // The eigenvectors are kept as rows, so their rotations run along rows
-    // too, and transposed once at the end.
-    var vt = identity(n);
-    let size = max(norm_fro(a), 1.0e-300);
-    var converged = false;
-    for sweep in 100 {
-        var off = 0.0;
-        for i in n {
-            // Summed directly: all minus diagonal would cancel catastrophically
-            // just when the diagonal dominates, and stop the sweeps too early.
-            let wi = row(w, i);
-            for x, j in wi { if j != i { off += x * x; } }
-        }
-        // Off-diagonal mass at rounding level is as converged as it gets.
-        if sqrt(off) <= EPS * size { converged = true; break; }
-        for p in n {
-            for q in p + 1..n {
-                let apq = w.data[p * n + q];
-                if abs(apq) <= EPS * 1.0e-3 * size {
-                    w.data[p * n + q] = 0.0;
-                    w.data[q * n + p] = 0.0;
-                    continue;
-                }
-                let app = w.data[p * n + p];
-                let aqq = w.data[q * n + q];
-                let theta = (aqq - app) / (2.0 * apq);
-                var t = 1.0 / (abs(theta) + sqrt(theta * theta + 1.0));
-                if theta < 0.0 { t = -t; }
-                let c = 1.0 / sqrt(t * t + 1.0);
-                let s = t * c;
-                // w = J^T w J. Outside the (p, q) block, rows p and q of the
-                // result are rows p and q of J^T w, rotated along the rows;
-                // columns p and q follow by symmetry.
-                let wp = row(w, p);
-                let wq = row(w, q);
-                assert(wp.len == n && wq.len == n);
-                for k in n {
-                    let x = wp[k];
-                    let y = wq[k];
-                    wp[k] = c * x - s * y;
-                    wq[k] = s * x + c * y;
-                }
-                for k in n {
-                    w.data[k * n + p] = wp[k];
-                    w.data[k * n + q] = wq[k];
-                }
-                // The block itself, where t was chosen to zero apq.
-                wp[p] = app - t * apq;
-                wq[q] = aqq + t * apq;
-                wp[q] = 0.0;
-                wq[p] = 0.0;
-                rotate_rows(vt, p, q, c, s);
+    var e: f64[>..] = [];
+    e.resize(n, 0.0);
+    values.resize(n, 0.0);
+    let d = values[..];
+
+    // tred2: reduce to tridiagonal form, d the diagonal and e the
+    // subdiagonal, accumulating the transformation in w.
+    for j in n { d[j] = w.data[j * n + n - 1]; }
+    for ii in n - 1 {
+        let i = n - 1 - ii;
+        // Scale to avoid under- and overflow.
+        var sc = 0.0;
+        var h = 0.0;
+        for k in i { sc += abs(d[k]); }
+        if sc == 0.0 {
+            e[i] = d[i - 1];
+            for j in i {
+                d[j] = w.data[j * n + i - 1];
+                w.data[j * n + i] = 0.0;
+                w.data[i * n + j] = 0.0;
+            }
+        } else {
+            // The Householder vector.
+            for k in i { d[k] /= sc; }
+            h = dot(d[..i], d[..i]);
+            var f = d[i - 1];
+            var g = sqrt(h);
+            if f > 0.0 { g = -g; }
+            e[i] = sc * g;
+            h -= f * g;
+            d[i - 1] = f - g;
+            for j in i { e[j] = 0.0; }
+            // The similarity transformation on the remaining columns.
+            for j in i {
+                let wj = row(w, j);
+                assert(wj.len == n);
+                f = d[j];
+                w.data[i * n + j] = f;
+                e[j] += wj[j] * f + dot(wj[j + 1..i], d[j + 1..i]);
+                axpy(f, wj[j + 1..i], e[j + 1..i]);
+            }
+            f = 0.0;
+            for j in i { e[j] /= h; }
+            f = dot(e[..i], d[..i]);
+            let hh = f / (h + h);
+            axpy(-hh, d[..i], e[..i]);
+            for j in i {
+                let wj = row(w, j);
+                assert(wj.len == n);
+                f = d[j];
+                g = e[j];
+                for k in j..i { wj[k] -= f * e[k] + g * d[k]; }
+                d[j] = wj[i - 1];
+                wj[i] = 0.0;
             }
         }
+        d[i] = h;
     }
-    values.clear();
-    for i in n { values.push(w.data[i * n + i]); }
+    // Accumulate the transformations.
+    for i in n - 1 {
+        let wi = row(w, i);
+        let wi1 = row(w, i + 1);
+        assert(wi.len == n && wi1.len == n);
+        wi[n - 1] = wi[i];
+        wi[i] = 1.0;
+        let h = d[i + 1];
+        if h != 0.0 {
+            for k in i + 1 { d[k] = wi1[k] / h; }
+            for j in i + 1 {
+                let wj = row(w, j);
+                axpy(-dot(wi1[..i + 1], wj[..i + 1]), d[..i + 1], wj[..i + 1]);
+            }
+        }
+        for k in i + 1 { wi1[k] = 0.0; }
+    }
+    for j in n {
+        d[j] = w.data[j * n + n - 1];
+        w.data[j * n + n - 1] = 0.0;
+    }
+    w.data[(n - 1) * n + n - 1] = 1.0;
+    e[0] = 0.0;
+
+    // tql2: diagonalize the tridiagonal matrix by implicit QL steps.
+    for i in 1..n { e[i - 1] = e[i]; }
+    e[n - 1] = 0.0;
+    var f = 0.0;
+    var tst1 = 0.0;
+    var converged = true;
+    for l in n {
+        // The first negligible subdiagonal element at or after l.
+        tst1 = max(tst1, abs(d[l]) + abs(e[l]));
+        var m = l;
+        while m < n {
+            if abs(e[m]) <= EPS * tst1 { break; }
+            m++;
+        }
+        // m == l: d[l] is an eigenvalue. Otherwise iterate.
+        if m > l {
+            var iter = 0;
+            loop {
+                iter++;
+                if iter > 60 { converged = false; break; }
+                // The implicit shift.
+                var g = d[l];
+                var p = (d[l + 1] - g) / (2.0 * e[l]);
+                var r = hypot2(p, 1.0);
+                if p < 0.0 { r = -r; }
+                d[l] = e[l] / (p + r);
+                d[l + 1] = e[l] * (p + r);
+                let dl1 = d[l + 1];
+                var h = g - d[l];
+                for i in l + 2..n { d[i] -= h; }
+                f += h;
+                // The implicit QL transformation.
+                p = d[m];
+                var c = 1.0;
+                var c2 = c;
+                var c3 = c;
+                let el1 = e[l + 1];
+                var s = 0.0;
+                var s2 = 0.0;
+                var i = m - 1;
+                while i >= l {
+                    c3 = c2;
+                    c2 = c;
+                    s2 = s;
+                    g = c * e[i];
+                    h = c * p;
+                    r = hypot2(p, e[i]);
+                    e[i + 1] = s * r;
+                    s = e[i] / r;
+                    c = p / r;
+                    p = c * d[i] - s * g;
+                    d[i + 1] = h + s * (c * g + s * d[i]);
+                    // Accumulate: columns i and i + 1 of V are rows of w.
+                    rotate_rows(w, i, i + 1, c, s);
+                    i--;
+                }
+                p = -s * s2 * c3 * el1 * e[l] / dl1;
+                e[l] = s * p;
+                d[l] = c * p;
+                if abs(e[l]) <= EPS * tst1 { break; }
+            }
+        }
+        d[l] += f;
+        e[l] = 0.0;
+    }
+
     // Ascending, moving the vectors with their values.
     for i in n {
         var best = i;
-        for j in i + 1..n { if values[j] < values[best] { best = j; } }
+        for j in i + 1..n { if d[j] < d[best] { best = j; } }
         if best != i {
-            let t = values[i];
-            values[i] = values[best];
-            values[best] = t;
-            swap_rows(vt, i, best);
+            let t = d[i];
+            d[i] = d[best];
+            d[best] = t;
+            swap_rows(w, i, best);
         }
     }
-    vectors = transpose(vt);
+    vectors = transpose(w);
     return converged;
 }
 
@@ -772,6 +982,44 @@ fn svd(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     return svd_tall(transpose(a), v, s, u);     // a^T = v diag(s) u^T
 }
 
+// x.x, y.y and x.y in one pass, with dot's lanes.
+fn gram2(x: f64[:], y: f64[:]) -> f64, f64, f64 {
+    let n = x.len;
+    assert(y.len == n);
+    var xx: f64[LANES] = [0.0; LANES];
+    var yy: f64[LANES] = [0.0; LANES];
+    var xy: f64[LANES] = [0.0; LANES];
+    let m = n - n % LANES;
+    var i = 0;
+    while i < m {
+        let xs = x[i..i + LANES];
+        let ys = y[i..i + LANES];
+        assert(xs.len == LANES && ys.len == LANES);
+        for k in LANES {
+            let a = xs[k];
+            let b = ys[k];
+            xx[k] += a * a;
+            yy[k] += b * b;
+            xy[k] += a * b;
+        }
+        i += LANES;
+    }
+    var sxx = 0.0;
+    var syy = 0.0;
+    var sxy = 0.0;
+    for k in LANES {
+        sxx += xx[k];
+        syy += yy[k];
+        sxy += xy[k];
+    }
+    for j in m..n {
+        sxx += x[j] * x[j];
+        syy += y[j] * y[j];
+        sxy += x[j] * y[j];
+    }
+    return sxx, syy, sxy;
+}
+
 // svd for rows >= cols. One-sided Jacobi rotates pairs of columns of a until
 // they are orthogonal; it works on a^T here, so each column is a contiguous
 // row, and so does v.
@@ -786,17 +1034,7 @@ fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
         var rotated = false;
         for p in n {
             for q in p + 1..n {
-                let up = row(ut, p);
-                let uq = row(ut, q);
-                assert(up.len == m && uq.len == m);
-                var alpha = 0.0;
-                var beta = 0.0;
-                var gamma = 0.0;
-                for i in m {
-                    alpha += up[i] * up[i];
-                    beta += uq[i] * uq[i];
-                    gamma += up[i] * uq[i];
-                }
+                let alpha, beta, gamma = gram2(row(ut, p), row(ut, q));
                 if abs(gamma) <= EPS * sqrt(alpha * beta) { continue; }
                 rotated = true;
                 let zeta = (beta - alpha) / (2.0 * gamma);

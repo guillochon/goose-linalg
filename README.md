@@ -48,55 +48,79 @@ fn main() {
 | LU | `lu_factor(a&, piv&) -> sign, ok`, `lu_solve(lu, piv, b)`, `det`, `solve(a, b) -> x, ok`, `solve_matrix(a, b) -> x, ok`, `inverse(a) -> inv, ok` |
 | Cholesky | `cholesky(a) -> l, ok`, `cholesky_solve(l, b)` |
 | QR | `qr(a, q&, r&)` (Householder, any shape), `lstsq(a, b) -> x, ok` |
-| Symmetric eigen | `eigh(a, values&, vectors&) -> converged` (Jacobi, ascending), `eigvals_sym(a)` |
+| Symmetric eigen | `eigh(a, values&, vectors&) -> converged` (tridiagonal QL, ascending; reads the upper triangle), `eigvals_sym(a)` |
 | SVD | `svd(a, u&, s&, v&) -> converged` (thin, one-sided Jacobi, descending), `singular_values`, `rank(a, tol)`, `pinv(a, tol)` |
 
 ## Algorithms and accuracy
 
-- `lu_factor` uses partial pivoting. `det` and `solve` are built on it.
+- `lu_factor` uses partial pivoting. `det`, `solve` and `inverse` are built on it, and
+  `solve_matrix` / `inverse` work on whole rows of right-hand sides at once.
 - `qr` uses Householder reflections. `lstsq` solves through QR and refuses rank-deficient input
   rather than returning garbage.
-- `eigh` uses cyclic Jacobi rotations and `svd` uses one-sided (Hestenes) Jacobi. Both are
-  simple, robust, and accurate to working precision, small singular values included. Each sweep
-  costs O(n³), so they're right for matrices up to a few hundred rows. They aren't a replacement
-  for LAPACK on big problems.
+- `eigh` reduces the matrix to tridiagonal form with Householder reflections, then diagonalizes it
+  with implicit QL steps and Wilkinson shifts. These are EISPACK's `tred2` and `tql2`, ported from
+  their public-domain JAMA form and run on the transposed matrix so their inner loops follow rows.
+- `svd` uses one-sided (Hestenes) Jacobi. It is accurate to working precision in the small
+  singular values too, but each sweep costs O(n³). It's the slowest routine relative to LAPACK,
+  which bidiagonalizes once instead.
 - `svd` always returns orthonormal `u` and `v`, completing the basis when the matrix is rank
   deficient.
+- Every sum goes through `dot`, which keeps 16 partial sums in a fixed array of lanes. Results are
+  deterministic for a given build: the summation order is fixed in the source, not chosen by the
+  compiler.
+
+## Building for speed
+
+`goose build` compiles with plain `/O2` (MSVC) or `-O2`, which targets baseline x86-64 (SSE2). For
+production, enable the CPU's vector units. With MSVC, set `CL` before building:
+
+```bash
+CL="/arch:AVX2 /fp:contract" goose build yourprogram.goose
+```
+
+With gcc or clang, the equivalent flags are `-march=x86-64-v3 -ffp-contract=fast`.
+
+Don't use `/fp:fast` or `-ffast-math`. They gain nothing here, because `linalg`'s own kernels
+already vectorize their sums. And they break IEEE semantics: under `/fp:fast`, MSVC folds
+`1.0 / 0.0` to `1e300`, and checks for NaN and infinity stop working. The test suite has two
+checks that fail under it.
 
 ## Performance
 
-The `bench/` folder times every operation against NumPy on OpenBLAS 0.3.29. The table is for
-n = 400, single-threaded, pinned to one performance core of an i5-12600K. Goose was built with
-MSVC `/O2`.
+The `bench/` folder times every operation against NumPy on OpenBLAS 0.3.29, which dispatches to
+AVX2/FMA kernels at run time. The setup is production on both sides: Goose built with
+`/arch:AVX2 /fp:contract`, OpenBLAS on one thread, both pinned to the same performance core of an
+i5-12600K. Times are for n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
-| Goose | 9.1 ms | 3.6 ms | 32 ms | 3.2 ms | 26 ms | 900 ms | 540 ms |
-| OpenBLAS | 2.1 ms | 1.3 ms | 4.5 ms | 1.2 ms | 6.7 ms | 12 ms | 26 ms |
-| ratio | 4.3× | 2.8× | 7.0× | 2.8× | 3.9× | 76× | 21× |
+| Goose | 2.6 ms | 3.0 ms | 7.8 ms | 2.0 ms | 19 ms | 23 ms | 340 ms |
+| OpenBLAS | 2.1 ms | 1.3 ms | 4.5 ms | 1.2 ms | 6.3 ms | 11 ms | 23 ms |
+| ratio | 1.25× | 2.3× | 1.75× | 1.7× | 3.1× | 2.0× | 15× |
 
-At n ≤ 50, `solve`, `det` and `cholesky` beat NumPy, which pays about 1–5 µs of call overhead per
-operation.
+`matmul` runs at 48 GFLOP/s against OpenBLAS's 61. At n = 50, `matvec`, `solve`, `det`,
+`cholesky` and `eigh` are as fast as NumPy or faster.
 
-Inner loops run over row slices whose lengths are `assert`ed. That lets Goose drop the bounds
-checks, and lets the C compiler vectorize update loops like `ri[j] -= f * rk[j]`. Dot-product
-loops (`s += x[k] * y[k]`) stay scalar, because MSVC won't reorder a floating-point sum without
-`/fp:fast`.
+What makes the kernels fast:
+- Inner loops run over row slices with `assert`ed lengths, so Goose drops their bounds checks.
+- Update loops (`ri[j] -= f * rk[j]`) then vectorize as written.
+- Sums use `dot`'s lane array, the one form MSVC vectorizes without fast-math.
+- `matmul` is register-blocked, four rows of the result by four steps of the inner dimension.
 
-The Jacobi eigensolvers rotate contiguous rows: `svd` works on transposed factors, and `eigh`
-keeps its eigenvectors as rows. Their remaining gap to LAPACK is algorithmic: every sweep costs
-O(n³), and LAPACK reduces to tridiagonal form once instead.
+Everything is single-threaded. On this hybrid CPU, multi-threaded OpenBLAS was more than 100× *slower* for
+LU at n = 400 than single-threaded OpenBLAS.
 
-To reproduce:
+To reproduce, in `bench/` on Windows with Goose on `PATH` (or `$env:GOOSE` set):
+
 ```bash
-goose build bench/bench.goose && cd bench && ./bench
+powershell -File run_pinned.ps1
 ```
 ```bash
-OPENBLAS_NUM_THREADS=1 python bench_lapack.py lapack_1t
+python compare.py
 ```
-```bash
-python bench_lapack.py lapack_mt && python compare.py
-```
+
+`run_pinned.ps1` builds the benchmark three ways (plain `/O2`, production flags and `/fp:fast` for
+reference) and runs each, plus OpenBLAS, pinned to one core.
 
 ## Tests
 
@@ -104,14 +128,16 @@ python bench_lapack.py lapack_mt && python compare.py
 goose test/test_linalg.goose
 ```
 
-The suite runs 988 checks and exits 1 on any failure. It has two kinds of checks:
+The suite runs 1,088 checks and exits 1 on any failure. It has two kinds of checks:
 - **Exact cases worked by hand:** the Hilbert inverse, a textbook Cholesky factor, Fibonacci
-  through `power`, and the path-graph Laplacian spectrum.
+  through `power`, the path-graph Laplacian spectrum, and Wilkinson's W₂₁⁺, whose eigenvalues come in
+  pairs that agree to about 10⁻¹⁴.
 - **Identities on random matrices:** checked at sizes 1–29, square, tall and wide. These cover
   `p a = l u`, `q r = a` with `q` orthogonal, `a v = v diag(w)`, `u s vᵀ = a`, the four
   Moore-Penrose conditions, `det(ab) = det(a) det(b)`, and more.
 
-The suite passes both in-process and in a native MSVC build. It was also mutation-tested: 23 bugs
-were planted in the library one at a time, and every one was caught.
+The suite passes in-process, as a native MSVC build, and with production flags. It was also
+mutation-tested: 36 bugs were planted in the library one at a time, and every one was caught.
+They covered the blocked `matmul`, the `dot` lanes, `tred2`/`tql2` and the multi-RHS solve.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.

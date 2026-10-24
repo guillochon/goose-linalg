@@ -221,6 +221,31 @@ fn test_products() {
     let empty = linalg::matmul(linalg::zeros(2, 0), linalg::zeros(0, 3));
     check(empty.rows == 2 && empty.cols == 3 && linalg::max_abs(empty) == 0.0, "inner dimension 0 gives zeros");
 
+    // matmul works on blocks of four rows and four inner steps: every
+    // remainder of both, against the naive triple loop.
+    var g0 = rng { 99 };
+    for rows in 1..10 {
+        for inner in [1, 3, 4, 5, 8, 11] {
+            let x = linalg::random(rows, inner, g0);
+            let y = linalg::random(inner, 6, g0);
+            var naive = linalg::zeros(rows, 6);
+            for i in rows { for j in 6 {
+                var s = 0.0;
+                for k in inner { s += linalg::at(x, i, k) * linalg::at(y, k, j); }
+                linalg::set(naive, i, j, s);
+            } }
+            check_mat(linalg::matmul(x, y), naive, 1.0e-14, str("blocked matmul remainders ", rows, "x", inner));
+        }
+    }
+    // dot keeps 16 partial sums: every remainder, against a plain loop.
+    for len in 0..40 {
+        let x = linalg::col(linalg::random(len, 1, g0), 0);
+        let y = linalg::col(linalg::random(len, 1, g0), 0);
+        var s = 0.0;
+        for i in len { s += x[i] * y[i]; }
+        check_close(linalg::dot(x, y), s, 1.0e-14, str("dot lanes and tail, len=", len));
+    }
+
     let fib = linalg::power(linalg::from_rows(2, 2, [1, 1, 1, 0]), 10);
     check(fib.data == [89.0, 55.0, 55.0, 34.0], "power: Fibonacci");
     let m = linalg::from_rows(2, 2, [2.0, -1, 0.5, 3]);
@@ -556,6 +581,22 @@ fn test_eigh() {
     }
     var want: f64[>..] = [];
     for k in 1..n + 1 { want.push(2.0 - 2.0 * cos(k * PI / (n + 1))); }
+    // Wilkinson's W21+: eigenvalues in pairs agreeing to about 1e-14, which
+    // still need orthogonal eigenvectors.
+    var wil = linalg::zeros(21, 21);
+    for i in 21 {
+        linalg::set(wil, i, i, abs(10 - i) * 1.0);
+        if i > 0 { linalg::set(wil, i, i - 1, 1.0); linalg::set(wil, i - 1, i, 1.0); }
+    }
+    check(linalg::eigh(wil, w, v), "W21+ converges");
+    check_close(w[20], 10.746194182903322, 1.0e-14, "W21+ largest eigenvalue");
+    check_close(w[20] - w[19], 0.0, 1.0e-13, "W21+ top pair nearly equal");
+    check(orthonormal_cols(v, 1.0e-13), "W21+ eigenvectors orthonormal");
+    check_mat(linalg::matmul(wil, v), linalg::matmul(v, linalg::diag(w)), 1.0e-12, "W21+ a v = v diag(w)");
+    // Only the upper triangle is read.
+    var junk = linalg::clone(lap);
+    for i in n { for j in i { linalg::set(junk, i, j, 99.0); } }
+    check_vec(linalg::eigvals_sym(junk), linalg::eigvals_sym(lap), 0.0, "eigh reads only the upper triangle");
     check(linalg::eigh(lap, w, v), "Laplacian converges");
     check_vec(w, want, 1.0e-14, "Laplacian spectrum");
     check_vec(linalg::eigvals_sym(lap), want, 1.0e-14, "eigvals_sym");
@@ -684,7 +725,7 @@ fn test_composition() {
     let a = linalg::from_rows(2, 2, [1, 2, 3, 4]);
     let r = linalg::trace(linalg::matmul(linalg::transpose(a), linalg::add(a, linalg::identity(2))));
     check(r == 35.0, "nested temporaries");
-    check(linalg::det(linalg::matmul(a, linalg::inverse(a))) == 1.0, "first result of a two-result call");
+    check_close(linalg::det(linalg::matmul(a, linalg::inverse(a))), 1.0, 1.0e-14, "first result of a two-result call");
     var acc = linalg::identity(2);
     for i in 3 {
         let next = linalg::matmul(acc, a);

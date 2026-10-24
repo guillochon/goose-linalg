@@ -1,8 +1,12 @@
 // Times linalg's operations at several sizes, for comparison with
 // bench_lapack.py (NumPy on OpenBLAS). Each timing is the best of several
-// runs; the results go to stdout and bench_goose.csv.
+// runs; the results go to stdout and to the CSV named on the command line
+// (bench_goose.csv by default).
 //
-//   goose build bench/bench.goose && bench/bench
+//   goose build bench/bench.goose && bench/bench [out.csv]
+//
+// For production flags with MSVC, set CL first (run_pinned.ps1 does):
+//   CL="/arch:AVX2 /fp:contract" goose build bench/bench.goose
 
 import std;
 import os;
@@ -72,6 +76,8 @@ fn main() {
             sink += s[0] + u.data[0];
         };
     }
-    if !write_file("bench_goose.csv", csv) { abort("cannot write bench_goose.csv"); }
+    let argv = args();
+    let path = if argv.len > 1 { argv[1] } else { "bench_goose.csv" };
+    if !write_file(path, csv) { abort(str("cannot write ", path)); }
     print("checksum ", sink);
 }
