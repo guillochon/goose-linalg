@@ -1,0 +1,17 @@
+# Executables and intermediates from `goose build` (it writes them beside the source)
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.a
+*.dSYM/
+test/test_linalg
+examples/fit
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
