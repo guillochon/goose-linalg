@@ -53,7 +53,7 @@ instead: `"guillochon/goose-linalg@<commit>"`.
 | Cholesky | `cholesky(a) -> l, ok`, `cholesky_solve(l, b)` |
 | QR | `qr(a, q&, r&)` (Householder, any shape), `lstsq(a, b) -> x, ok` |
 | Symmetric eigen | `eigh(a, values&, vectors&) -> converged` (tridiagonal QL, ascending; reads the upper triangle), `eigvals_sym(a)` |
-| SVD | `svd(a, u&, s&, v&) -> converged` (thin, one-sided Jacobi, descending), `singular_values`, `rank(a, tol)`, `pinv(a, tol)` |
+| SVD | `svd(a, u&, s&, v&) -> converged` (thin, Golub-Kahan, descending), `singular_values`, `rank(a, tol)`, `pinv(a, tol)` |
 
 ## Algorithms and accuracy
 
@@ -64,11 +64,13 @@ instead: `"guillochon/goose-linalg@<commit>"`.
 - `eigh` reduces the matrix to tridiagonal form with Householder reflections, then diagonalizes it
   with implicit QL steps and Wilkinson shifts. These are EISPACK's `tred2` and `tql2`, ported from
   their public-domain JAMA form and run on the transposed matrix so their inner loops follow rows.
-- `svd` uses one-sided (Hestenes) Jacobi. It is accurate to working precision in the small
-  singular values too, but each sweep costs O(n³). It's the slowest routine relative to LAPACK,
-  which bidiagonalizes once instead.
-- `svd` always returns orthonormal `u` and `v`, completing the basis when the matrix is rank
-  deficient.
+- `svd` uses Golub-Kahan-Reinsch. Householder reflections reduce the matrix to bidiagonal form,
+  then implicit-shift QR steps diagonalize it. This is LINPACK's `dsvdc` by way of JAMA, and
+  LAPACK's SVD routines build on the same reduction. Like `eigh`, it works on transposed
+  storage. Every singular value is accurate to about ε·σ_max, so a value far below σ_max is
+  only accurate in absolute terms (a one-sided Jacobi SVD would also get those right relative
+  to their own size).
+- `svd` always returns orthonormal `u` and `v`, rank-deficient matrices included.
 - Every sum goes through `dot`, which keeps 16 partial sums in a fixed array of lanes. Results are
   deterministic for a given build: the summation order is fixed in the source, not chosen by the
   compiler.
@@ -86,24 +88,31 @@ With gcc or clang, the equivalent flags are `-march=x86-64-v3 -ffp-contract=fast
 
 Don't use `/fp:fast` or `-ffast-math`. They gain nothing here, because `linalg`'s own kernels
 already vectorize their sums. And they break IEEE semantics: under `/fp:fast`, MSVC folds
-`1.0 / 0.0` to `1e300`, and checks for NaN and infinity stop working. The test suite has two
-checks that fail under it.
+`1.0 / 0.0` to `1e300`, and checks for NaN and infinity stop working. One check in the test
+suite fails under it.
 
 ## Performance
 
 The `bench/` folder times every operation against NumPy on OpenBLAS 0.3.29, which dispatches to
 AVX2/FMA kernels at run time. The setup is production on both sides: Goose built with
 `/arch:AVX2 /fp:contract`, OpenBLAS on one thread, both pinned to the same performance core of an
-i5-12600K. Times are for n = 400:
+i5-12600K.
+
+![Goose linalg against OpenBLAS](docs/benchmark.png)
+
+On the left is the time ratio to OpenBLAS at each size; 1.0 means parity. The dotted lines are an
+earlier version of this package built with the same flags (commit `c7ddf93`), before the lane
+kernels, the blocked `matmul`, and the QL `eigh` and Golub-Kahan `svd`. On the right are absolute
+times at n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
-| Goose | 2.6 ms | 3.0 ms | 7.8 ms | 2.0 ms | 19 ms | 23 ms | 340 ms |
-| OpenBLAS | 2.1 ms | 1.3 ms | 4.5 ms | 1.2 ms | 6.3 ms | 11 ms | 23 ms |
-| ratio | 1.25× | 2.3× | 1.75× | 1.7× | 3.1× | 2.0× | 15× |
+| Goose | 2.6 ms | 3.0 ms | 7.9 ms | 2.0 ms | 18 ms | 26 ms | 54 ms |
+| OpenBLAS | 2.1 ms | 1.3 ms | 4.4 ms | 1.1 ms | 6.2 ms | 11 ms | 22 ms |
+| ratio | 1.2× | 2.3× | 1.8× | 1.8× | 2.9× | 2.3× | 2.4× |
 
-`matmul` runs at 48 GFLOP/s against OpenBLAS's 61. At n = 50, `matvec`, `solve`, `det`,
-`cholesky` and `eigh` are as fast as NumPy or faster.
+`matmul` runs at 49 GFLOP/s against OpenBLAS's 61. At n = 50, `matvec`, `solve`, `det`,
+`cholesky`, `eigh` and `svd` are as fast as NumPy or faster.
 
 What makes the kernels fast:
 - Inner loops run over row slices with `assert`ed lengths, so Goose drops their bounds checks.
@@ -132,21 +141,27 @@ reference) and runs each, plus OpenBLAS, pinned to one core.
 goose test/test_linalg.goose
 ```
 
-The suite runs 1,088 checks and exits 1 on any failure. It has two kinds of checks:
+The suite runs 1,117 checks and exits 1 on any failure. It has two kinds of checks:
 - **Exact cases worked by hand:** the Hilbert inverse, a textbook Cholesky factor, Fibonacci
   through `power`, the path-graph Laplacian spectrum, and Wilkinson's W₂₁⁺, whose eigenvalues come in
   pairs that agree to about 10⁻¹⁴.
+- **SVD edge cases:** matrices that force the bidiagonal QR to split and to deflate, graded
+  singular values from 1 down to 10⁻¹⁵, and clustered singular values that only converge with
+  the Wilkinson shift.
 - **Identities on random matrices:** checked at sizes 1–29, square, tall and wide. These cover
   `p a = l u`, `q r = a` with `q` orthogonal, `a v = v diag(w)`, `u s vᵀ = a`, the four
   Moore-Penrose conditions, `det(ab) = det(a) det(b)`, and more.
 
 The suite passes in-process, as a native MSVC build, and with production flags. It was also
-mutation-tested: 36 bugs were planted in the library one at a time, and every one was caught.
-They covered the blocked `matmul`, the `dot` lanes, `tred2`/`tql2` and the multi-RHS solve.
+mutation-tested: 48 bugs were planted in the library one at a time. Every one that changes the
+library's behavior was caught; the one survivor swaps the Wilkinson shift for a simpler shift that
+also converges. The mutants covered the blocked `matmul`, the `dot` lanes, `tred2`/`tql2`, every
+branch of the Golub-Kahan iteration, and the multi-RHS solve.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.
 
 ## License
 
-Apache-2.0, the same license as Goose itself (see `LICENSE`). The symmetric eigensolver is a port of
-the public-domain JAMA library's `tred2`/`tql2`, which in turn derive from EISPACK.
+Apache-2.0, the same license as Goose itself (see `LICENSE`). The symmetric eigensolver and the SVD
+are ports of the public-domain JAMA library's versions of EISPACK's `tred2`/`tql2` and LINPACK's
+`dsvdc`.

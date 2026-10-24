@@ -653,6 +653,70 @@ fn test_svd() {
     check(linalg::cond(linalg::zeros(2, 2)) == 1.0 / 0.0, "cond of zero is inf");
     check_close(linalg::norm2(linalg::from_rows(2, 2, [3, 0, 4, 5])), sqrt(45.0), 1.0e-14, "norm2");
 
+    // Matrices that drive the bidiagonal QR into its rarer branches: a zero
+    // singular value mid-diagonal (a split), a zero at the end (a
+    // deflation), a zero column, and all singular values equal.
+    var odd = linalg::zeros(0, 0);
+    for case in 4 {
+        odd = if case == 0 { linalg::diag([3.0, 0, 2]) }
+              else if case == 1 { linalg::from_rows(3, 3, [1, 1, 0, 0, 1, 1, 0, 0, 0]) }
+              else if case == 2 { linalg::from_rows(3, 3, [1, 0, 2, 3, 0, 4, 5, 0, 6]) }
+              else { linalg::from_rows(2, 2, [0.6, -0.8, 0.8, 0.6]) };
+        let what = str("special case ", case);
+        check(linalg::svd(odd, u, s, v), str(what, " converges"));
+        check(orthonormal_cols(u, 1.0e-14) && orthonormal_cols(v, 1.0e-14), str(what, " orthonormal factors"));
+        check_mat(linalg::matmul(linalg::matmul(u, linalg::diag(s)), linalg::transpose(v)), odd, 1.0e-14,
+                  str(what, " u s v^T = a"));
+        var desc = true;
+        for i in 1..s.len { desc = desc && s[i - 1] >= s[i]; }
+        check(desc && s[s.len - 1] >= 0.0, str(what, " descending, non-negative"));
+    }
+    check_vec(linalg::singular_values(linalg::diag([3.0, 0, 2])), [3, 2, 0], 1.0e-15, "split at a zero");
+    check_vec(linalg::singular_values(linalg::from_rows(2, 2, [0.6, -0.8, 0.8, 0.6])), [1, 1], 1.0e-15,
+              "orthogonal matrix");
+
+    // Graded singular values, 1 down to 1e-15, behind random orthogonal
+    // factors: each comes back within eps * s_max (Golub-Kahan's guarantee).
+    var gq = rng { 21 };
+    var q1 = linalg::zeros(0, 0);
+    var r1 = linalg::zeros(0, 0);
+    var q2 = linalg::zeros(0, 0);
+    linalg::qr(linalg::random(6, 6, gq), q1, r1);
+    linalg::qr(linalg::random(4, 4, gq), q2, r1);
+    let graded = [1.0, 1.0e-5, 1.0e-10, 1.0e-15];
+    var sig = linalg::zeros(6, 4);
+    for i in 4 { linalg::set(sig, i, i, graded[i]); }
+    let gm = linalg::matmul(linalg::matmul(q1, sig), linalg::transpose(q2));
+    check_vec(linalg::singular_values(gm), graded, 1.0e-15, "graded singular values");
+    check(linalg::rank(gm) == 3, "graded: the 1e-15 value is below the rank tolerance");
+
+    // A zero on the diagonal of an upper bidiagonal matrix survives the
+    // bidiagonalization, so the QR phase must split there.
+    let split = linalg::from_rows(4, 4, [1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1]);
+    check(linalg::svd(split, u, s, v), "split converges");
+    check_mat(linalg::matmul(linalg::matmul(u, linalg::diag(s)), linalg::transpose(v)), split, 1.0e-14,
+              "split u s v^T = a");
+    check(orthonormal_cols(u, 1.0e-14) && orthonormal_cols(v, 1.0e-14), "split orthonormal factors");
+    check_close(s[3], 0.0, 1.0e-15, "split: the matrix is singular");
+
+    // Tightly clustered singular values converge only with the Wilkinson
+    // shift: unshifted QR would need on the order of 1e5 iterations.
+    var clustered: f64[>..] = [];
+    for i in 10 { clustered.push(1.0 - 1.0e-4 * i); }
+    var qa = linalg::zeros(0, 0);
+    var qb = linalg::zeros(0, 0);
+    linalg::qr(linalg::random(10, 10, gq), qa, r1);
+    linalg::qr(linalg::random(10, 10, gq), qb, r1);
+    let cm = linalg::matmul(linalg::matmul(qa, linalg::diag(clustered)), linalg::transpose(qb));
+    check(linalg::svd(cm, u, s, v), "clustered singular values converge");
+    check_vec(s, clustered, 1.0e-14, "clustered singular values");
+
+    // A larger tall matrix.
+    let big = linalg::random(60, 40, gq);
+    check(linalg::svd(big, u, s, v), "60x40 converges");
+    check_mat(linalg::matmul(linalg::matmul(u, linalg::diag(s)), linalg::transpose(v)), big, 1.0e-12, "60x40 u s v^T = a");
+    check(orthonormal_cols(u, 1.0e-12) && orthonormal_cols(v, 1.0e-12), "60x40 orthonormal factors");
+
     // The pseudoinverse of an invertible matrix is its inverse.
     let sq = linalg::from_rows(3, 3, [2, -1, 0, -1, 2, -1, 0, -1, 2]);
     let sqinv, sqok = linalg::inverse(sq);

@@ -946,132 +946,269 @@ fn eigvals_sym(a) -> f64[>..] {
 // ---------------------------------------------------------------------------
 // Singular value decomposition
 
-// Makes the rows of m from `from` on orthonormal to all the rows before
-// them, by Gram-Schmidt on unit vectors.
-fn complete_rows(m: matrix&, from: i64) {
-    let len = m.cols;
-    var e = 0;
-    for j in from..m.rows {
-        let rj = row(m, j);
-        loop {
-            assert(e < len);
-            for x, i in rj { rj[i] = if i == e { 1.0 } else { 0.0 }; }
-            e++;
-            for pass in 2 {
-                for k in j {
-                    let rk = row(m, k);
-                    axpy(-dot(rk, rj), rk, rj);
-                }
-            }
-            let nrm = vnorm(rj);
-            if nrm > 0.5 {
-                for &x in rj { x /= nrm; }
-                break;
-            }
-        }
-    }
-}
-
 // The thin SVD of a rows x cols matrix, k = min(rows, cols):
 // a = u diag(s) v^T with u rows x k and v cols x k, both with orthonormal
-// columns, and s descending and non-negative. One-sided Jacobi (Hestenes),
-// accurate to working precision in the small singular values too. Returns
-// false if it did not converge.
+// columns, and s descending and non-negative. Returns false if the QR
+// iteration did not converge.
 fn svd(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     if a.rows >= a.cols { return svd_tall(a, u, s, v); }
     return svd_tall(transpose(a), v, s, u);     // a^T = v diag(s) u^T
 }
 
-// x.x, y.y and x.y in one pass, with dot's lanes.
-fn gram2(x: f64[:], y: f64[:]) -> f64, f64, f64 {
-    let n = x.len;
-    assert(y.len == n);
-    var xx: f64[LANES] = [0.0; LANES];
-    var yy: f64[LANES] = [0.0; LANES];
-    var xy: f64[LANES] = [0.0; LANES];
-    let m = n - n % LANES;
-    var i = 0;
-    while i < m {
-        let xs = x[i..i + LANES];
-        let ys = y[i..i + LANES];
-        assert(xs.len == LANES && ys.len == LANES);
-        for k in LANES {
-            let a = xs[k];
-            let b = ys[k];
-            xx[k] += a * a;
-            yy[k] += b * b;
-            xy[k] += a * b;
-        }
-        i += LANES;
-    }
-    var sxx = 0.0;
-    var syy = 0.0;
-    var sxy = 0.0;
-    for k in LANES {
-        sxx += xx[k];
-        syy += yy[k];
-        sxy += xy[k];
-    }
-    for j in m..n {
-        sxx += x[j] * x[j];
-        syy += y[j] * y[j];
-        sxy += x[j] * y[j];
-    }
-    return sxx, syy, sxy;
-}
-
-// svd for rows >= cols. One-sided Jacobi rotates pairs of columns of a until
-// they are orthogonal; it works on a^T here, so each column is a contiguous
-// row, and so does v.
+// svd for rows >= cols, by Golub-Kahan-Reinsch: Householder reflections
+// reduce a to bidiagonal form, then implicit-shift QR steps diagonalize the
+// bidiagonal. This is LINPACK's dsvdc by way of JAMA. The classical
+// algorithm walks the columns of a, u and v; here all three are kept
+// transposed, so every walk is along a row.
 fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     assert(a.rows >= a.cols);
     let m = a.rows;
     let n = a.cols;
-    var ut = transpose(a);
-    var vt = identity(n);
-    var converged = false;
-    for sweep in 100 {
-        var rotated = false;
-        for p in n {
-            for q in p + 1..n {
-                let alpha, beta, gamma = gram2(row(ut, p), row(ut, q));
-                if abs(gamma) <= EPS * sqrt(alpha * beta) { continue; }
-                rotated = true;
-                let zeta = (beta - alpha) / (2.0 * gamma);
-                var t = 1.0 / (abs(zeta) + sqrt(1.0 + zeta * zeta));
-                if zeta < 0.0 { t = -t; }
-                let c = 1.0 / sqrt(1.0 + t * t);
-                let sn = c * t;
-                rotate_rows(ut, p, q, c, sn);
-                rotate_rows(vt, p, q, c, sn);
+    s.clear();
+    guard n > 0 else {
+        u = zeros(m, 0);
+        v = zeros(0, 0);
+        return true;
+    }
+    var at = transpose(a);      // row j is column j of a
+    var ut = zeros(n, m);       // row j is column j of u
+    var vt = zeros(n, n);       // row j is column j of v
+    s.resize(n, 0.0);
+    var e: f64[>..] = [];
+    e.resize(n, 0.0);
+    var work: f64[>..] = [];
+    work.resize(m, 0.0);
+
+    // Bidiagonalize: the diagonal into s, the superdiagonal into e.
+    let nct = min(m - 1, n);
+    let nrt = max(0, min(n - 2, m));
+    for k in max(nct, nrt) {
+        let ak = row(at, k);
+        assert(ak.len == m);
+        if k < nct {
+            // The reflection for column k; its diagonal entry into s[k].
+            var sk = vnorm(ak[k..]);
+            if sk != 0.0 {
+                if ak[k] < 0.0 { sk = -sk; }
+                for i in k..m { ak[i] /= sk; }
+                ak[k] += 1.0;
+            }
+            s[k] = -sk;
+        }
+        for j in k + 1..n {
+            let aj = row(at, j);
+            assert(aj.len == m);
+            if k < nct && s[k] != 0.0 {
+                axpy(-dot(ak[k..], aj[k..]) / ak[k], ak[k..], aj[k..]);
+            }
+            // Row k of a, for the row reflection.
+            e[j] = aj[k];
+        }
+        if k < nct {
+            let uk = row(ut, k);
+            for i in k..m { uk[i] = ak[i]; }
+        }
+        if k < nrt {
+            // The reflection for row k; its superdiagonal entry into e[k].
+            var ek = vnorm(e[k + 1..]);
+            if ek != 0.0 {
+                if e[k + 1] < 0.0 { ek = -ek; }
+                for i in k + 1..n { e[i] /= ek; }
+                e[k + 1] += 1.0;
+            }
+            e[k] = -ek;
+            if k + 1 < m && e[k] != 0.0 {
+                let wk = work[k + 1..];
+                for &x in wk { x = 0.0; }
+                for j in k + 1..n { axpy(e[j], row(at, j)[k + 1..], wk); }
+                for j in k + 1..n { axpy(-e[j] / e[k + 1], wk, row(at, j)[k + 1..]); }
+            }
+            let vk = row(vt, k);
+            for i in k + 1..n { vk[i] = e[i]; }
+        }
+    }
+
+    // The bidiagonal matrix, of order p.
+    var p = min(n, m + 1);
+    if nct < n { s[nct] = at.data[nct * m + nct]; }
+    if m < p { s[p - 1] = 0.0; }
+    if nrt + 1 < p { e[nrt] = at.data[(p - 1) * m + nrt]; }
+    e[p - 1] = 0.0;
+
+    // Generate u from its reflections, last first.
+    for j in nct..n {
+        let uj = row(ut, j);
+        for &x in uj { x = 0.0; }
+        uj[j] = 1.0;
+    }
+    for kk in nct {
+        let k = nct - 1 - kk;
+        let uk = row(ut, k);
+        assert(uk.len == m);
+        if s[k] != 0.0 {
+            for j in k + 1..n {
+                let uj = row(ut, j);
+                axpy(-dot(uk[k..], uj[k..]) / uk[k], uk[k..], uj[k..]);
+            }
+            for i in k..m { uk[i] = -uk[i]; }
+            uk[k] += 1.0;
+            for i in k { uk[i] = 0.0; }
+        } else {
+            for &x in uk { x = 0.0; }
+            uk[k] = 1.0;
+        }
+    }
+
+    // Generate v likewise.
+    for kk in n {
+        let k = n - 1 - kk;
+        let vk = row(vt, k);
+        assert(vk.len == n);
+        if k < nrt && e[k] != 0.0 {
+            for j in k + 1..n {
+                let vj = row(vt, j);
+                axpy(-dot(vk[k + 1..], vj[k + 1..]) / vk[k + 1], vk[k + 1..], vj[k + 1..]);
             }
         }
-        if !rotated { converged = true; break; }
+        for &x in vk { x = 0.0; }
+        vk[k] = 1.0;
     }
-    // The singular values are the row norms; sort, then normalize.
-    s.clear();
-    for j in n { s.push(vnorm(row(ut, j))); }
-    for i in n {
-        var best = i;
-        for j in i + 1..n { if s[j] > s[best] { best = j; } }
-        if best != i {
-            let t = s[i];
-            s[i] = s[best];
-            s[best] = t;
-            swap_rows(ut, i, best);
-            swap_rows(vt, i, best);
+
+    // Diagonalize the bidiagonal. Rotations of columns j and q of u or v
+    // are rotations of rows of ut or vt: x' = c x + s y, y' = -s x + c y
+    // is rotate_rows with -s.
+    let pp = p - 1;
+    var iter = 0;
+    let tiny = pow(2.0, -966.0);
+    var converged = true;
+    while p > 0 {
+        if iter > 75 { converged = false; break; }
+        // k: the last negligible superdiagonal entry before p - 1, or -1.
+        var k = p - 2;
+        while k >= 0 {
+            if abs(e[k]) <= tiny + EPS * (abs(s[k]) + abs(s[k + 1])) {
+                e[k] = 0.0;
+                break;
+            }
+            k--;
+        }
+        // 1: s[p - 1] and e[k] negligible, k < p: deflate s[p - 1].
+        // 2: s[k] negligible, k < p: split at k.
+        // 3: e[k] negligible, k < p, s[k..p] not: a QR step.
+        // 4: e[p - 2] negligible: s[p - 1] has converged.
+        var kase = 0;
+        if k == p - 2 {
+            kase = 4;
+        } else {
+            var ks = p - 1;
+            while ks > k {
+                let t = abs(e[ks]) + (if ks != k + 1 { abs(e[ks - 1]) } else { 0.0 });
+                if abs(s[ks]) <= tiny + EPS * t {
+                    s[ks] = 0.0;
+                    break;
+                }
+                ks--;
+            }
+            if ks == k {
+                kase = 3;
+            } else if ks == p - 1 {
+                kase = 1;
+            } else {
+                kase = 2;
+                k = ks;
+            }
+        }
+        k++;
+
+        if kase == 1 {
+            var f = e[p - 2];
+            e[p - 2] = 0.0;
+            var j = p - 2;
+            while j >= k {
+                let t = hypot2(s[j], f);
+                let cs = s[j] / t;
+                let sn = f / t;
+                s[j] = t;
+                if j != k {
+                    f = -sn * e[j - 1];
+                    e[j - 1] = cs * e[j - 1];
+                }
+                rotate_rows(vt, j, p - 1, cs, -sn);
+                j--;
+            }
+        } else if kase == 2 {
+            var f = e[k - 1];
+            e[k - 1] = 0.0;
+            for j in k..p {
+                let t = hypot2(s[j], f);
+                let cs = s[j] / t;
+                let sn = f / t;
+                s[j] = t;
+                f = -sn * e[j];
+                e[j] = cs * e[j];
+                rotate_rows(ut, j, k - 1, cs, -sn);
+            }
+        } else if kase == 3 {
+            // The shift, from the trailing 2x2 of b^T b.
+            let sc = max(max(max(max(abs(s[p - 1]), abs(s[p - 2])), abs(e[p - 2])), abs(s[k])), abs(e[k]));
+            let sp = s[p - 1] / sc;
+            let spm1 = s[p - 2] / sc;
+            let epm1 = e[p - 2] / sc;
+            let sk = s[k] / sc;
+            let ek = e[k] / sc;
+            let b = ((spm1 + sp) * (spm1 - sp) + epm1 * epm1) / 2.0;
+            let c = (sp * epm1) * (sp * epm1);
+            var shift = 0.0;
+            if b != 0.0 || c != 0.0 {
+                shift = sqrt(b * b + c);
+                if b < 0.0 { shift = -shift; }
+                shift = c / (b + shift);
+            }
+            var f = (sk + sp) * (sk - sp) + shift;
+            var g = sk * ek;
+            // Chase the bulge down the bidiagonal.
+            for j in k..p - 1 {
+                var t = hypot2(f, g);
+                var cs = f / t;
+                var sn = g / t;
+                if j != k { e[j - 1] = t; }
+                f = cs * s[j] + sn * e[j];
+                e[j] = cs * e[j] - sn * s[j];
+                g = sn * s[j + 1];
+                s[j + 1] = cs * s[j + 1];
+                rotate_rows(vt, j, j + 1, cs, -sn);
+                t = hypot2(f, g);
+                cs = f / t;
+                sn = g / t;
+                s[j] = t;
+                f = cs * e[j] + sn * s[j + 1];
+                s[j + 1] = -sn * e[j] + cs * s[j + 1];
+                g = sn * e[j + 1];
+                e[j + 1] = cs * e[j + 1];
+                if j < m - 1 { rotate_rows(ut, j, j + 1, cs, -sn); }
+            }
+            e[p - 2] = f;
+            iter++;
+        } else {
+            // Converged: make s[k] non-negative, then move it into order.
+            if s[k] <= 0.0 {
+                s[k] = if s[k] < 0.0 { -s[k] } else { 0.0 };
+                let vk = row(vt, k);
+                for i in pp + 1 { vk[i] = -vk[i]; }
+            }
+            while k < pp {
+                if s[k] >= s[k + 1] { break; }
+                let t = s[k];
+                s[k] = s[k + 1];
+                s[k + 1] = t;
+                if k < n - 1 { swap_rows(vt, k, k + 1); }
+                if k < m - 1 { swap_rows(ut, k, k + 1); }
+                k++;
+            }
+            iter = 0;
+            p--;
         }
     }
-    let tiny = if n > 0 { s[0] * EPS * m } else { 0.0 };
-    var nonzero = 0;
-    for j in n {
-        if s[j] > tiny && s[j] > 0.0 {
-            for &x in row(ut, j) { x /= s[j]; }
-            nonzero = j + 1;
-        }
-    }
-    // Rows for zero singular values: any orthonormal completion.
-    complete_rows(ut, nonzero);
     u = transpose(ut);
     v = transpose(vt);
     return converged;

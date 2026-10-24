@@ -14,6 +14,7 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 
 
 def load(path):
@@ -57,12 +58,13 @@ for i, op in enumerate(ops):
         ax[0].plot(sizes, [prev[(op, n)] / one[(op, n)] for n in sizes], ":", color=colors[i], alpha=0.6)
 ax[0].axhline(1, color="k", lw=0.8)
 ax[0].set(xscale="log", yscale="log", xlabel="n (n x n matrices)", ylabel="Goose time / OpenBLAS time",
-          title="vs 1-thread OpenBLAS, both AVX2 (solid: now, dotted: before)")
+          title="vs 1-thread OpenBLAS, both AVX2 (dotted: earlier version)")
 ax[0].set_xticks(sizes, [str(n) for n in sizes])
+ax[0].xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
 ax[0].legend(ncol=3, fontsize=8)
 
 n = sizes[-1]
-series = [(name, data) for name, data in [("Goose before", prev), ("Goose now", now),
+series = [(name, data) for name, data in [("Goose, earlier version", prev), ("Goose linalg", now),
                                           ("OpenBLAS, 1 thread", one), ("OpenBLAS, 16 threads", multi)] if data]
 w = 0.8 / len(series)
 for s, (name, data) in enumerate(series):
