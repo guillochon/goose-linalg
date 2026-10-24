@@ -1,16 +1,17 @@
 """Compare the Goose runs against OpenBLAS: a table and compare.png.
 
-    python compare.py      (in this directory, after run_pinned.ps1)
+    python compare.py [--with-prev]      (in this directory, after run_pinned.ps1)
 
 The headline comparison is production against production: Goose built with
 /arch:AVX2 /fp:contract (bench_goose_avx2.csv) against single-threaded
 OpenBLAS (bench_lapack_1t.csv), both pinned to one P-core. Other runs are
 shown when their CSVs exist: bench_goose_prev_avx2.csv (an earlier version,
-same flags), bench_goose_base.csv (plain /O2), bench_goose_fast.csv
+same flags; in the table always, in the chart only with --with-prev), bench_goose_base.csv (plain /O2), bench_goose_fast.csv
 (/fp:fast, reference only) and bench_lapack_mt.csv (all cores).
 """
 import csv
 import os
+import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -26,6 +27,7 @@ def load(path):
 
 now = load("bench_goose_avx2.csv")
 prev = load("bench_goose_prev_avx2.csv")
+chart_prev = prev if "--with-prev" in sys.argv else None
 base = load("bench_goose_base.csv")
 fast = load("bench_goose_fast.csv")
 one = load("bench_lapack_1t.csv")
@@ -54,17 +56,19 @@ fig, ax = plt.subplots(1, 2, figsize=(13, 5.2))
 colors = plt.cm.tab10.colors
 for i, op in enumerate(ops):
     ax[0].plot(sizes, [now[(op, n)] / one[(op, n)] for n in sizes], "o-", color=colors[i], label=op)
-    if prev:
-        ax[0].plot(sizes, [prev[(op, n)] / one[(op, n)] for n in sizes], ":", color=colors[i], alpha=0.6)
+    if chart_prev:
+        ax[0].plot(sizes, [chart_prev[(op, n)] / one[(op, n)] for n in sizes], ":", color=colors[i], alpha=0.6)
 ax[0].axhline(1, color="k", lw=0.8)
 ax[0].set(xscale="log", yscale="log", xlabel="n (n x n matrices)", ylabel="Goose time / OpenBLAS time",
-          title="vs 1-thread OpenBLAS, both AVX2 (dotted: earlier version)")
+          title="vs 1-thread OpenBLAS, both AVX2" + (" (dotted: earlier version)" if chart_prev else ""))
 ax[0].set_xticks(sizes, [str(n) for n in sizes])
 ax[0].xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+ax[0].yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}x"))
+ax[0].yaxis.set_minor_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}x" if v in (0.5, 2, 3, 5) else ""))
 ax[0].legend(ncol=3, fontsize=8)
 
 n = sizes[-1]
-series = [(name, data) for name, data in [("Goose, earlier version", prev), ("Goose linalg", now),
+series = [(name, data) for name, data in [("Goose, earlier version", chart_prev), ("Goose linalg", now),
                                           ("OpenBLAS, 1 thread", one), ("OpenBLAS, 16 threads", multi)] if data]
 w = 0.8 / len(series)
 for s, (name, data) in enumerate(series):

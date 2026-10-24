@@ -100,10 +100,8 @@ i5-12600K.
 
 ![Goose linalg against OpenBLAS](docs/benchmark.png)
 
-On the left is the time ratio to OpenBLAS at each size; 1.0 means parity. The dotted lines are an
-earlier version of this package built with the same flags (commit `c7ddf93`), before the lane
-kernels, the blocked `matmul`, and the QL `eigh` and Golub-Kahan `svd`. On the right are absolute
-times at n = 400:
+On the left is the time ratio to OpenBLAS at each size; 1x means parity. On the right are
+absolute times at n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
