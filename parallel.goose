@@ -1,6 +1,6 @@
 // linalg.parallel: multithreaded versions of linalg's heavy operations.
 //
-//   import linalg from "guillochon/goose-linalg@v0.2.1";
+//   import linalg from "guillochon/goose-linalg@v0.2.2";
 //   import linalg.parallel;
 //
 //   linalg::set_threads(6);              // optional; hardware_threads() by default
@@ -91,10 +91,15 @@ fn stop_threads() {
 // the copies pay, so small matrices exercise the parallel paths.
 fn set_parallel_always(on: bool) { mt_always = on; }
 
-// For testing: the size from which the LU family factors owner-computes
-// (on LU_OC_THREADS threads or more), LU_OC_MIN by default. Past one outer
-// block, any size works.
-fn set_owner_computes_from(n: i64) { lu_oc_min = n; }
+// For testing: from n rows (past one outer block, any size works), the LU
+// family factors owner-computes (on LU_OC_THREADS threads or more), and
+// solve_matrix_mt and inverse_mt solve owner-computes however few
+// right-hand sides there are. n <= 0 restores the defaults.
+fn set_owner_computes_from(n: i64) {
+    lu_oc_min = if n > 0 { n } else { LU_OC_MIN };
+    solve_oc_min = if n > 0 { n } else { SOLVE_OC_MIN };
+    solve_oc_any_width = n > 0;
+}
 
 // How many shares of work the workers have taken so far, products from
 // the pool and panels sent to owner-computes workers: zero while every
@@ -233,14 +238,42 @@ fn solve_mt(a, b: f64[:]) -> f64[>..], bool {
     return solve_with(a, b, lu_factor_mt);
 }
 
+// From SOLVE_OC_MIN rows, solve_matrix_mt and inverse_mt share their
+// triangular solves owner-computes, by columns of the right-hand sides
+// (lu_solve_oc), when there are at least half as many right-hand sides as
+// rows (inverse always has as many). Otherwise they go through gemm_mt. On
+// an i5-12600K, owner-computes won from n = 600 on 2, 3, 4 and 6 threads;
+// with fewer right-hand sides, sending every worker the factored matrix
+// cost more than it saved (at n = 1600 on 6 threads, 39 ms against 4 for
+// 16 columns, and even at 512).
+let SOLVE_OC_MIN = 600;
+var solve_oc_min = SOLVE_OC_MIN;
+var solve_oc_any_width = false;
+
+fn solve_oc_here(n: i64, m: i64) -> bool {
+    n >= solve_oc_min && (solve_oc_any_width || 2 * m >= n)
+}
+
 fn solve_matrix_mt(a, b) -> matrix, bool {
     if serial_here(a.rows) { return solve_matrix(a, b); }
-    return solve_matrix_with(a, b, lu_factor_mt, gemm_mt);
+    if !solve_oc_here(a.rows, b.cols) { return solve_matrix_with(a, b, lu_factor_mt, gemm_mt); }
+    assert(a.rows == a.cols && a.rows == b.rows);
+    var lu = clone(a);
+    var piv: i64[>..] = [];
+    let sign, ok = lu_factor_mt(lu, piv);
+    guard ok else { return zeros(0, 0), false; }
+    return lu_solve_oc(lu, piv, b, false), true;
 }
 
 fn inverse_mt(a) -> matrix, bool {
     if serial_here(a.rows) { return inverse(a); }
-    return inverse_with(a, lu_factor_mt, gemm_mt);
+    if !solve_oc_here(a.rows, a.rows) { return inverse_with(a, lu_factor_mt, gemm_mt); }
+    assert(a.rows == a.cols);
+    var lu = clone(a);
+    var piv: i64[>..] = [];
+    let sign, ok = lu_factor_mt(lu, piv);
+    guard ok else { return zeros(0, 0), false; }
+    return lu_solve_oc(lu, piv, a, true), true;
 }
 
 fn cholesky_mt(a) -> matrix, bool {
@@ -256,8 +289,9 @@ fn cholesky_mt(a) -> matrix, bool {
 // past the first outer block live on the workers instead, dealt out in
 // blocks of LU_DB columns round-robin, and come back only when their turn
 // as a panel comes. Each outer step the calling thread factors the panel
-// with the serial code and sends it, with its row swaps, to every worker
-// that still owns columns. Each worker applies the swaps and runs
+// with the serial code and sends it, with its row swaps, down a tree of all
+// the workers (lu_broadcast). Each worker that still owns columns applies the
+// swaps and runs
 // lu_outer_update on its own columns: those of the next panel first, which
 // it sends back at once so the calling thread can factor them while the
 // rest are updated. Copies are O(p n^2) in all, and the result is
@@ -279,6 +313,8 @@ let LU_SLOTS = 8;
 let LU_INIT = 0;
 let LU_PANEL = 1;
 let LU_QUIT = 2;
+let LU_SOLVE = 3;
+let LU_INVERT = 4;
 
 struct lu_s0 {}
 struct lu_s1 {}
@@ -294,9 +330,18 @@ struct lu_s7 {}
 // workers in dests: the panel goes down them as a tree, each worker passing
 // it on to LU_FAN more before it starts its own work, so the calling thread
 // sends it only LU_FAN times.
+//
+// The triangular solves (lu_solve_oc): LU_SOLVE, or LU_INVERT for the
+// identity's columns, which each worker makes itself, carries the factored
+// matrix down the tree as a panel goes. The worker then takes solve_tasks
+// until one with c0 < 0.
 struct lu_msg<S> { kind: i64, o0: i64, o1: i64, swaps: i64[], dests: i64[], p: tile }
 // From a worker: columns col0.. of the next panel, every row.
 struct lu_cols { col0: i64, c: tile }
+// Columns c0..c1 of the right-hand sides, in pivot order (none for the
+// identity's), for whichever thread takes them; and back, solved.
+struct solve_task { c0: i64, c1: i64, x: tile }
+struct solve_done { c0: i64, c1: i64, x: tile }
 
 // The columns worker `me` of nw owns, as runs [c0, c1, c0, c1, ...].
 fn lu_runs(n: i64, me: i64, nw: i64) -> i64[>..] {
@@ -311,13 +356,36 @@ fn lu_runs(n: i64, me: i64, nw: i64) -> i64[>..] {
     return runs;
 }
 
+// The right-hand sides go out SOLVE_DB columns to a task: narrow enough to
+// even out the threads' shares, wide enough for gemm_acc to run well. 128
+// beat 32 and 64 by 10-25% at n = 1600 on 3 and 6 threads; 192 and 256
+// were no better.
+let SOLVE_DB = 128;
+
+// Columns c0..c1 of the right-hand sides, x (with tri, the identity's, made
+// here), through both triangular solves with lu: what serial
+// solve_matrix_with and inverse_with do to each of them, bit for bit.
+fn solve_block(lu, x: matrix&, tri: bool, c0: i64, c1: i64) {
+    let n = lu.rows;
+    var below: i64[>..] = [];
+    if tri {
+        x.rows = n;
+        x.cols = c1 - c0;
+        x.data.clear();
+        x.data.resize(n * (c1 - c0), 0.0);
+        for j in c1 - c0 { x.data[(c0 + j) * (c1 - c0) + j] = 1.0; }
+        for r in n + 1 { below.push(max(0, min(r - c0, c1 - c0))); }
+    }
+    forward_unit_cols_with(lu, x, tri, below, gemm_acc);
+    backward_with(lu, x, gemm_acc);
+}
+
 fn lu_worker_body<S>(marker: S, me: i64, nw: i64) {
     var s = matrix { rows: 0, cols: 0, data: [] };
     var gcol: i64[>..] = [];        // the column of a that each of s's is
     var first = 0;                  // s's columns before this have gone back
     loop {
         let m = qget<lu_msg<S>>();
-        guard m.kind != LU_QUIT else { break; }
         if m.kind == LU_INIT {
             s.rows = m.o0;
             s.cols = m.p.cols;
@@ -329,7 +397,19 @@ fn lu_worker_body<S>(marker: S, me: i64, nw: i64) {
         var q = 0;
         while m.dests[q] != me { q++; }
         for child in (q + 1) * LU_FAN..(q + 2) * LU_FAN {
-            if child < m.dests.len { lu_send(m.dests[child], LU_PANEL, m.o0, m.o1, m.swaps, m.dests, m.p); }
+            if child < m.dests.len { lu_send(m.dests[child], m.kind, m.o0, m.o1, m.swaps, m.dests, m.p); }
+        }
+        guard m.kind != LU_QUIT else { break; }
+        if m.kind != LU_PANEL {
+            loop {
+                let t = qget<solve_task>();
+                guard t.c0 >= 0 else { break; }
+                var x = matrix { rows: t.x.rows, cols: t.x.cols, data: [] };
+                x.data.append(t.x.data);
+                solve_block(m.p, x, m.kind == LU_INVERT, t.c0, t.c1);
+                qput(solve_done { c0: t.c0, c1: t.c1, x: tile { rows: x.rows, cols: x.cols, data: x.data[..] } });
+            }
+            continue;
         }
         let n = s.rows;
         let w = s.cols;
@@ -391,6 +471,17 @@ fn lu_send(me: i64, kind: i64, o0: i64, o1: i64, swaps: i64[:], dests: i64[:], p
     else { lu_put(lu_s7 {}, kind, o0, o1, swaps, dests, p); }
 }
 
+// Sends a message to all nw workers down the tree: the calling thread to
+// the first LU_FAN, each of those to LU_FAN more, and so on. The tree is the
+// same for every message, so each worker hears everything from one sender,
+// in the order it was sent: a worker can't get a panel ahead of the one
+// before it, or LU_QUIT ahead of the last broadcast.
+fn lu_broadcast(nw: i64, kind: i64, o0: i64, o1: i64, swaps: i64[:], p) {
+    var dests: i64[>..] = [];
+    for w in nw { dests.push(w); }
+    for q in min(LU_FAN, nw) { lu_send(q, kind, o0, o1, swaps, dests, p); }
+}
+
 // lu_factor, owner-computes: the same factors bit for bit.
 fn lu_factor_oc(a: matrix&, piv: i64[>..]&) -> f64, bool {
     assert(a.rows == a.cols);
@@ -424,10 +515,8 @@ fn lu_factor_oc(a: matrix&, piv: i64[>..]&) -> f64, bool {
         if !pok { ok = false; }
         if o1 < n {
             let p = rows_tile(a, o0, o0, n - o0, o1 - o0);
-            var dests: i64[>..] = [];
-            for w in nw { if last[w] >= o1 { dests.push(w); } }
-            for q in min(LU_FAN, dests.len) { lu_send(dests[q], LU_PANEL, o0, o1, swaps, dests, p); }
-            mt_jobs += dests.len;
+            lu_broadcast(nw, LU_PANEL, o0, o1, swaps, p);
+            for w in nw { if last[w] >= o1 { mt_jobs++; } }
             // The next panel, whole columns, from their owners.
             let o2 = min(o1 + OB, n);
             var got = 0;
@@ -445,7 +534,90 @@ fn lu_factor_oc(a: matrix&, piv: i64[>..]&) -> f64, bool {
         }
         o0 = o1;
     }
-    for w in nw { lu_send(w, LU_QUIT, 0, 0, [], [], empty_tile()); }
+    lu_broadcast(nw, LU_QUIT, 0, 0, [], empty_tile());
     for id in ids { thread_wait(id); }
     return sign, ok;
+}
+
+// The triangular solves of solve_matrix and inverse, owner-computes: the
+// right-hand sides' columns are independent, so each worker and the calling
+// thread take a share of them, the workers getting the factored matrix once
+// down the tree. With tri, the right-hand sides are the identity, which each
+// owner makes for itself, and the result is a's inverse: the solved columns
+// go back in piv's order. Otherwise b's rows go out in piv's order and the
+// result is x with a x = b. Either is the serial result bit for bit.
+// The triangular solves of solve_matrix and inverse, owner-computes: the
+// right-hand sides' columns are independent, so they go out as tasks of
+// SOLVE_DB columns, which the workers take as soon as they have the
+// factored matrix (sent once, down the tree) and the calling thread takes
+// meanwhile, so a worker that starts late takes fewer. With tri, the
+// right-hand sides are the identity, which each task makes for itself, and
+// the result is a's inverse: the solved columns go back in piv's order.
+// Otherwise b's rows go out in piv's order and the result is x with
+// a x = b. Either is the serial result bit for bit.
+fn lu_solve_oc(lu, piv: i64[:], b, tri: bool) -> matrix {
+    let n = lu.rows;
+    let m = if tri { n } else { b.cols };
+    let nw = min(threads() - 1, LU_SLOTS);
+    var ids: i64[>..] = [];
+    for w in nw { ids.push(lu_spawn(w, nw)); }
+    lu_broadcast(nw, if tri { LU_INVERT } else { LU_SOLVE }, 0, 0, [], lu);
+    var tasks = 0;
+    var c0 = 0;
+    while c0 < m {
+        let c1 = min(c0 + SOLVE_DB, m);
+        if tri {
+            qput(solve_task { c0: c0, c1: c1, x: empty_tile() });
+        } else {
+            var d: f64[>..] = [];
+            for i in n { d.append(row(b, piv[i])[c0..c1]); }
+            qput(solve_task { c0: c0, c1: c1, x: tile { rows: n, cols: c1 - c0, data: d[..] } });
+        }
+        tasks++;
+        c0 = c1;
+    }
+    for w in nw { qput(solve_task { c0: -1, c1: -1, x: empty_tile() }); }
+    var out = zeros(n, m);
+    // The calling thread's tasks, until it meets the first end marker
+    // (every task is ahead of them), which it leaves for its worker.
+    var mine = 0;
+    loop {
+        let t, got = qpoll<solve_task>();
+        guard got else { break; }
+        if t.c0 < 0 {
+            qput(t);
+            break;
+        }
+        var x = matrix { rows: t.x.rows, cols: t.x.cols, data: [] };
+        x.data.append(t.x.data);
+        solve_block(lu, x, tri, t.c0, t.c1);
+        solve_place(out, x, t.c0, piv, tri);
+        mine++;
+    }
+    mt_jobs += tasks - mine;
+    for k in tasks - mine {
+        let d = qget<solve_done>();
+        solve_place(out, d.x, d.c0, piv, tri);
+    }
+    lu_broadcast(nw, LU_QUIT, 0, 0, [], empty_tile());
+    for id in ids { thread_wait(id); }
+    return out;
+}
+
+// Solved columns c0.. of the right-hand sides, x, into their places in out:
+// column c is column c of the solution, or with tri column piv[c] of the
+// inverse.
+fn solve_place(out: matrix&, x, c0: i64, piv: i64[:], tri: bool) {
+    let w = x.cols;
+    for i in out.rows {
+        let xi = x.data[i * w..(i + 1) * w];
+        let oi = row(out, i)[c0..c0 + w];
+        assert(xi.len == w && oi.len == w);
+        if tri {
+            let full = row(out, i);
+            for j in w { full[piv[c0 + j]] = xi[j]; }
+        } else {
+            for j in w { oi[j] = xi[j]; }
+        }
+    }
 }

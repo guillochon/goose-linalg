@@ -754,9 +754,19 @@ let OB = 256;
 // starts out as the identity, and row i of the result is zero past column i
 // (the forward half of inverse), which every step skips.
 fn forward_unit_with<G>(lu, x: matrix&, tri: bool) {
+    var below: i64[>..] = [];
+    if tri { for r in x.rows + 1 { below.push(r); } }
+    forward_unit_cols_with(lu, x, tri, below, G);
+}
+
+// forward_unit_with on some of the columns: with tri, x's first below[r]
+// columns are the identity's columns before r, and the rest come after it.
+// Every column is computed on its own, so each comes out the same bit for
+// bit whichever others x holds.
+fn forward_unit_cols_with<G>(lu, x: matrix&, tri: bool, below: i64[:]) {
     let n = x.rows;
     let m = x.cols;
-    fn width(r: i64) -> i64 { if tri { r } else { m } }
+    fn width(r: i64) -> i64 { if tri { below[r] } else { m } }
     var o0 = 0;
     while o0 < n {
         let o1 = min(o0 + OB, n);
@@ -769,7 +779,7 @@ fn forward_unit_with<G>(lu, x: matrix&, tri: bool) {
                 let li = row(lu, i);
                 let xi = row(x, i);
                 for k in i0..i {
-                    let w = if tri { k + 1 } else { m };
+                    let w = width(k + 1);
                     axpy(-li[k], row(x, k)[..w], xi[..w]);
                 }
             }

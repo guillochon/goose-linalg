@@ -23,6 +23,35 @@ fn check(ok: bool, what: const u8[:]) {
     print("FAIL ", what);
 }
 
+// Nothing left in any queue once an _mt call has returned: a stale message
+// would be read by the next call.
+fn left_over<T>(n: i64) -> i64 {
+    var k = n;
+    loop {
+        let t, got = qpoll<T>();
+        guard got else { break; }
+        k++;
+    }
+    return k;
+}
+
+fn queues_empty() -> bool {
+    var k = left_over<linalg::mt_job>(0);
+    k = left_over<linalg::mt_done>(k);
+    k = left_over<linalg::lu_cols>(k);
+    k = left_over<linalg::solve_task>(k);
+    k = left_over<linalg::solve_done>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s0>>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s1>>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s2>>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s3>>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s4>>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s5>>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s6>>(k);
+    k = left_over<linalg::lu_msg<linalg::lu_s7>>(k);
+    return k == 0;
+}
+
 // Bit for bit: same shape, and no entry differs at all.
 fn same(a, b) -> bool { linalg::same_shape(a, b) && a.data == b.data }
 
@@ -73,7 +102,7 @@ fn run(threads: i64) {
         let c1, co1 = linalg::cholesky_mt(spd);
         let c2, co2 = linalg::cholesky(spd);
         check(co1 == co2 && same(c1, c2), str("cholesky", what));
-
+        check(queues_empty(), str("no messages left over", what));
     }
 }
 
@@ -86,8 +115,8 @@ fn main() {
     // Again with the LU family owner-computes past one outer block, the
     // last past the worker slots it has.
     linalg::set_owner_computes_from(linalg::OB + 1);
-    for t in [3, 6, 10] { run(t); }
-    linalg::set_owner_computes_from(linalg::LU_OC_MIN);
+    for t in [2, 3, 6, 10] { run(t); }
+    linalg::set_owner_computes_from(0);
     linalg::set_parallel_always(false);
 
     // The cost model on its own: a large product pays for its copies, a
@@ -129,6 +158,18 @@ fn main() {
     let x1, xo1 = linalg::solve_matrix_mt(big, rhs);
     let x2, xo2 = linalg::solve_matrix(big, rhs);
     check(xo1 && xo2 && same(x1, x2), "solve_matrix 1200 x 300, cost model");
+    // Fewer right-hand sides than tasks for the workers, owner-computes
+    // anyway: the case that once left a message behind, a worker told to
+    // quit before the factored matrix reached it down the tree.
+    linalg::set_owner_computes_from(linalg::OB + 1);
+    for m in [1, 40] {
+        let narrow = linalg::random(1200, m, gm);
+        let y1, yo1 = linalg::solve_matrix_mt(big, narrow);
+        let y2, yo2 = linalg::solve_matrix(big, narrow);
+        check(yo1 && yo2 && same(y1, y2), str("solve_matrix 1200 x ", m, ", owner-computes"));
+        check(queues_empty(), str("no messages left over after solve_matrix 1200 x ", m));
+    }
+    linalg::set_owner_computes_from(0);
     var spd = linalg::matmul(big, linalg::transpose(big));
     linalg::add_scaled(spd, 1200.0, linalg::identity(1200));
     // cholesky's outer updates are a third of LU's work and sit near the
