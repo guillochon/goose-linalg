@@ -237,6 +237,18 @@ fn test_products() {
             check_mat(linalg::matmul(x, y), naive, 1.0e-14, str("blocked matmul remainders ", rows, "x", inner));
         }
     }
+    // gemm_acc goes through b in cache blocks of 256 rows by 512 columns: a
+    // product past both, against the naive triple loop.
+    let wide_a = linalg::random(5, 600, g0);
+    let wide_b = linalg::random(600, 1100, g0);
+    var wide_naive = linalg::zeros(5, 1100);
+    for i in 5 { for j in 1100 {
+        var s = 0.0;
+        for k in 600 { s += linalg::at(wide_a, i, k) * linalg::at(wide_b, k, j); }
+        linalg::set(wide_naive, i, j, s);
+    } }
+    check_mat(linalg::matmul(wide_a, wide_b), wide_naive, 1.0e-12, "matmul past the cache blocks, 5x600 * 600x1100");
+
     // dot keeps 16 partial sums: every remainder, against a plain loop.
     for len in 0..40 {
         let x = linalg::col(linalg::random(len, 1, g0), 0);
@@ -784,11 +796,12 @@ fn test_svd() {
 }
 
 // Sizes past the blocked algorithms' panel width (32): one column over a
-// block, exactly two blocks, and three blocks plus a remainder.
+// block, exactly two blocks, three blocks plus a remainder, and one outer
+// block (256) plus a remainder.
 fn test_blocked() {
     group("blocked sizes");
     var g = rng { 23 };
-    for n in [33, 64, 97] {
+    for n in [33, 64, 97, 300] {
         let t = 1.0e-13 * n;
         let a = linalg::random(n, n, g);
         // p a = l u.

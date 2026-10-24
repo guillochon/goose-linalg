@@ -1,41 +1,67 @@
-# Builds the Goose benchmark under several MSVC flag sets and runs it, and
-# the OpenBLAS benchmark, each pinned to one performance core so that a
-# hybrid CPU (P- and E-cores) does not move them around mid-run.
+# Builds the Goose benchmarks with MSVC and runs them, and the OpenBLAS
+# benchmark, pinned to performance cores so that a hybrid CPU (P- and
+# E-cores) does not move them around mid-run.
 #
-#   powershell -File bench\run_pinned.ps1 [-Core 4] [-Only goose|lapack]
+#   powershell -File bench\run_pinned.ps1 [-Core 4] [-Threads 6] [-ThreadMask 0x555] [-Only goose|lapack|mt]
 #
-# Writes bench_goose_<config>.csv and bench_lapack_1t.csv / _mt.csv here.
-param([int]$Core = 4, [string]$Only = "")
+# Single-threaded (n = 50..400), pinned to logical CPU -Core:
+#   bench_goose_<config>.csv for three flag sets, bench_lapack_1t.csv
+# Multithreaded (n = 400..1600), pinned to -ThreadMask, one logical CPU of
+# each performance core (0, 2, ..., 10 on an i5-12600K, whose E-cores are
+# 12-15):
+#   bench_goose_mt.csv, bench_lapack_mt1.csv (1 thread), bench_lapack_mt.csv
+# Unpinned, or on all 16 logical CPUs, OpenBLAS's LU ran 100x slower.
+param([int]$Core = 4, [int]$Threads = 6, [long]$ThreadMask = 0x555, [string]$Only = "")
 
 $here = $PSScriptRoot
 $goose = if ($env:GOOSE) { $env:GOOSE } else { "goose" }
-$mask = [IntPtr](1 -shl $Core)
 
-function Run-Pinned($exe, $argList, $log, [bool]$pin = $true) {
+function Run-Pinned($exe, $argList, $log, [long]$affinity) {
     $p = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $here -NoNewWindow -PassThru `
         -RedirectStandardOutput $log
-    if ($pin) { $p.ProcessorAffinity = $mask }
+    $p.ProcessorAffinity = [IntPtr]$affinity
     $p.WaitForExit()
 }
 
-if ($Only -ne "lapack") {
+# Builds a benchmark, failing loudly: a stale executable left by a failed
+# build would quietly measure old code.
+function Build($src, $exe, $flags) {
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    $env:CL = $flags
+    & $goose build -o $exe $src | Out-Null
+    Remove-Item Env:CL -ErrorAction SilentlyContinue
+    if (-not (Test-Path $exe)) { throw "building $src failed" }
+}
+
+$one = [long](1 -shl $Core)
+if ($Only -eq "" -or $Only -eq "goose") {
     $configs = [ordered]@{
         "base" = "";                            # what `goose build` does: /O2
         "avx2" = "/arch:AVX2 /fp:contract";     # production: AVX2 + FMA, IEEE semantics kept
         "fast" = "/arch:AVX2 /fp:fast";         # reference only: breaks inf/NaN semantics
     }
     foreach ($name in $configs.Keys) {
-        $env:CL = $configs[$name]
-        & $goose build -o "$here\bench_$name.exe" "$here\bench.goose" | Out-Null
-        Remove-Item Env:CL -ErrorAction SilentlyContinue
-        Run-Pinned "$here\bench_$name.exe" @("bench_goose_$name.csv") "$here\log_$name.txt"
+        Build "$here\bench.goose" "$here\bench_$name.exe" $configs[$name]
+        Run-Pinned "$here\bench_$name.exe" @("bench_goose_$name.csv") "$here\log_$name.txt" $one
         Write-Output "goose $name done"
     }
 }
-if ($Only -ne "goose") {
+if ($Only -eq "" -or $Only -eq "lapack") {
     $env:OPENBLAS_NUM_THREADS = "1"
-    Run-Pinned "python" @("bench_lapack.py", "lapack_1t") "$here\log_lapack_1t.txt"
+    Run-Pinned "python" @("bench_lapack.py", "lapack_1t") "$here\log_lapack_1t.txt" $one
     Remove-Item Env:OPENBLAS_NUM_THREADS
-    Run-Pinned "python" @("bench_lapack.py", "lapack_mt") "$here\log_lapack_mt.txt" $false   # all cores
-    Write-Output "openblas done"
+    Write-Output "openblas 1 thread done"
+}
+if ($Only -eq "" -or $Only -eq "mt") {
+    Build "$here\bench_mt.goose" "$here\bench_mt.exe" "/arch:AVX2 /fp:contract"
+    Run-Pinned "$here\bench_mt.exe" @("bench_goose_mt.csv", "$Threads") "$here\log_mt.txt" $ThreadMask
+    Write-Output "goose multithreaded done"
+    $env:BENCH_SIZES = "400,800,1600"
+    $env:BENCH_OPS = "matmul,det,solve,solve_matrix,inverse,cholesky"
+    $env:OPENBLAS_NUM_THREADS = "1"
+    Run-Pinned "python" @("bench_lapack.py", "lapack_mt1") "$here\log_lapack_mt1.txt" $one
+    $env:OPENBLAS_NUM_THREADS = "$Threads"
+    Run-Pinned "python" @("bench_lapack.py", "lapack_mt") "$here\log_lapack_mt.txt" $ThreadMask
+    Remove-Item Env:OPENBLAS_NUM_THREADS, Env:BENCH_SIZES, Env:BENCH_OPS
+    Write-Output "openblas multithreaded done"
 }

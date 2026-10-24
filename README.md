@@ -1,10 +1,11 @@
 # linalg
 
 Dense real linear algebra for [Goose](https://aardappel.github.io/goose/), in pure Goose: no C, no
-build step, nothing to install.
+build step, nothing to install. An optional module, `linalg.parallel`, runs the large products on
+several threads.
 
 ```goose
-import linalg from "guillochon/goose-linalg@main";     // or from "../goose-linalg" for a local checkout
+import linalg from "guillochon/goose-linalg@v0.2.0";   // or from "../goose-linalg" for a local checkout
 
 fn main() {
     let a = linalg::from_rows(3, 3, [4, 1, 2, 1, 3, 0, 2, 0, 5]);
@@ -13,9 +14,9 @@ fn main() {
 }
 ```
 
-Goose fetches the package the first time a program uses it. A branch like `@main` is pinned at
-whatever was fetched first, until `goose fetch --update`. For reproducible builds, pin a commit
-instead: `"guillochon/goose-linalg@<commit>"`.
+Goose fetches the package the first time a program uses it. Pin a tag, as here, or a commit
+(`"guillochon/goose-linalg@<commit>"`). A branch like `@main` is pinned at whatever was fetched
+first, until `goose fetch --update`.
 
 ## Conventions
 
@@ -54,17 +55,18 @@ instead: `"guillochon/goose-linalg@<commit>"`.
 | QR | `qr(a, q&, r&)` (Householder, any shape), `lstsq(a, b) -> x, ok` |
 | Symmetric eigen | `eigh(a, values&, vectors&) -> converged` (tridiagonal QL, ascending; reads the upper triangle), `eigvals_sym(a)` |
 | SVD | `svd(a, u&, s&, v&) -> converged` (thin, Golub-Kahan, descending), `singular_values`, `rank(a, tol)`, `pinv(a, tol)` |
+| Multithreaded (`import linalg.parallel`) | `matmul_mt`, `lu_factor_mt`, `det_mt`, `solve_mt`, `solve_matrix_mt`, `inverse_mt`, `cholesky_mt`; `set_threads(n)`, `threads()`, `stop_threads()`, `parallel_jobs()` |
 
 ## Algorithms and accuracy
 
-- `lu_factor` uses partial pivoting, blocked as LAPACK's `getrf`. It factors a panel of 32
-  columns, solves for the matching block row of U, then updates the trailing matrix with one
-  matrix multiply. Up to 64 columns it runs unblocked. `det`, `solve`, `solve_matrix` and
-  `inverse` are built on it. The triangular solves behind `solve_matrix` and `inverse` are blocked
-  the same way. `inverse` also skips the zeros of L⁻¹, so it costs about 2n³ flops rather than
-  2⅔n³.
-- `cholesky` is blocked as `potrf`: a 32-column panel, then a matrix-multiply update of the
-  trailing lower triangle.
+- `lu_factor` uses partial pivoting, blocked twice as LAPACK's `getrf`. Within an outer block of
+  256 columns it factors 32-column panels, each updating the rest of the outer block with one
+  matrix multiply; then the outer block updates the whole trailing matrix, 256 deep. Up to 64
+  columns it runs unblocked. `det`, `solve`, `solve_matrix` and `inverse` are built on it. The
+  triangular solves behind `solve_matrix` and `inverse` are blocked the same two ways. `inverse`
+  also skips the zeros of L⁻¹, so it costs about 2n³ flops rather than 2⅔n³.
+- `cholesky` is blocked the same way, as `potrf`: 32-column panels within 256-column outer
+  blocks, each level updating its trailing lower triangle with matrix multiplies.
 - `qr` uses Householder reflections, blocked as `geqrf`/`orgqr` with the compact WY form. The 32
   reflectors of a panel combine into I − V·T·Vᵀ, so the rest of R, and later Q, take each block
   as two matrix multiplies. `lstsq` solves through QR and refuses rank-deficient input rather
@@ -98,14 +100,73 @@ With gcc or clang, the equivalent flags are `-march=x86-64-v3 -ffp-contract=fast
 Don't use `/fp:fast` or `-ffast-math`. They gain nothing here, because `linalg`'s own kernels
 already vectorize their sums. And they break IEEE semantics: under `/fp:fast`, MSVC folds
 `1.0 / 0.0` to `1e300`, and checks for NaN and infinity stop working. One check in the test
-suite fails under it.
+suite fails under it. It also ends `linalg.parallel`'s bit-for-bit match with the serial results:
+fast-math lets the compiler build the worker threads' copy of the kernel with a different
+summation order.
+
+## Multithreading
+
+```goose
+import linalg from "guillochon/goose-linalg@v0.2.0";
+import linalg.parallel;
+
+fn main() {
+    linalg::set_threads(6);                     // optional: hardware_threads() by default
+    var r = rng { 1 };
+    let a = linalg::random(1600, 1600, r);
+    let c = linalg::matmul_mt(a, a);
+    let inv, ok = linalg::inverse_mt(a);
+}
+```
+
+A program that imports `linalg.parallel` contains a `thread_fn`, so it must be built with
+`goose build`: the in-process `goose run` can't run threads. Programs that import only `linalg`
+are unaffected.
+
+Each `_mt` function is its serial namesake with one change: the kernel of its large matrix
+products, `gemm_mt`, shares a product's rows (or columns) out between a pool of worker threads and
+the calling thread. The results are **bit for bit the serial ones** under IEEE floating point (not
+under `/fp:fast`).
+
+Goose threads share no memory: a worker is a separate program, and its operands and results are
+copied through typed queues. On the test machine a number costs about 1.6 ns to cross a queue
+(each message is a fresh allocation), so sharing a product pays only when it does enough work per
+number copied. `gemm_mt` estimates both sides, and keeps any product that wouldn't pay on the
+calling thread. In practice:
+
+- `matmul_mt` pays from about n = 500.
+- The LU family (`lu_factor_mt`, `det_mt`, `solve_mt`, `solve_matrix_mt`, `inverse_mt`) and
+  `cholesky_mt` share only their 256-deep outer updates, from about n = 1000. Up to n = 256 they
+  are the serial code.
+- `qr`, `lstsq`, `eigh` and `svd` have no `_mt` versions. Their products are blocks of 32
+  reflectors, too narrow ever to pay for the copies.
+
+So an `_mt` function is never slower than its serial version (measured from n = 100 to 1600 on 2
+and 6 threads, the worst ratio was 0.98×, within noise), and faster where there is enough work to
+share.
+
+On a CPU with performance and efficiency cores, set the thread count to the number of performance
+cores. Call the `_mt` functions from main's thread: they share one pool and its queues, which live
+in globals no worker can reach, so a `thread_fn` that calls them is a compile error rather than a
+race.
 
 ## Performance
 
-The `bench/` folder times every operation against NumPy on OpenBLAS 0.3.29, which dispatches to
-AVX2/FMA kernels at run time. The setup is production on both sides: Goose built with
-`/arch:AVX2 /fp:contract`, OpenBLAS on one thread, both pinned to the same performance core of an
-i5-12600K.
+### Test setup
+
+| | |
+|---|---|
+| CPU | Intel Core i5-12600K (Alder Lake). 6 performance cores with Hyper-Threading: logical CPUs 0–11, 3.7 GHz base, 4.9 GHz turbo, 48 KB L1d and 1.25 MB L2 each. 4 efficiency cores: logical CPUs 12–15, 3.6 GHz turbo, 2 MB shared L2. 20 MB shared L3. |
+| Memory | 32 GB DDR5-6200 (2 × 16 GB Corsair Vengeance, CMK32GX5M2B6200C36) |
+| Board | ASUS ROG STRIX Z690-I GAMING WIFI |
+| OS | Windows 11 Home 23H2 (build 22631), High performance power plan |
+| Goose | v2026.3, compiled by MSVC 19.44 (Visual Studio 2022, toolset 14.44) with `/O2 /arch:AVX2 /fp:contract` |
+| Reference | NumPy 2.2.6 on Python 3.12.0, linked to OpenBLAS 0.3.29 (`DYNAMIC_ARCH`, which picks AVX2/FMA kernels on this CPU) |
+| Pinning | Single-threaded runs on logical CPU 4, a performance core. Multithreaded runs use 6 threads pinned to logical CPUs 0, 2, 4, 6, 8 and 10, one per performance core. Unpinned, or on all 16 logical CPUs, OpenBLAS's LU ran more than 100× slower than on one thread. |
+
+Every time is the best of at least three runs and 0.3 s.
+
+### Single-threaded
 
 ![Goose linalg against OpenBLAS](docs/benchmark.png)
 
@@ -114,9 +175,9 @@ absolute times at n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
-| Goose | 2.6 ms | 1.7 ms | 4.1 ms | 1.0 ms | 6.5 ms | 21 ms | 42 ms |
-| OpenBLAS | 2.0 ms | 1.2 ms | 4.4 ms | 1.2 ms | 6.1 ms | 11 ms | 21 ms |
-| ratio | 1.3× | 1.4× | **0.94×** | **0.90×** | 1.06× | 1.9× | 2.0× |
+| Goose | 2.6 ms | 1.7 ms | 4.5 ms | 1.1 ms | 6.9 ms | 22 ms | 48 ms |
+| OpenBLAS | 2.0 ms | 1.3 ms | 4.4 ms | 1.1 ms | 6.1 ms | 11 ms | 22 ms |
+| ratio | 1.25× | 1.3× | 1.0× | 1.0× | 1.1× | 1.9× | 2.1× |
 
 `matmul` runs at 50 GFLOP/s against OpenBLAS's 62. At n = 50, `matvec`, `solve`, `det`,
 `inverse`, `cholesky` and `eigh` are as fast as NumPy or faster.
@@ -129,15 +190,36 @@ What makes the kernels fast:
   rows of the result by four steps of the inner dimension. `matmul` is a single call to it, and
   the blocked LU, Cholesky, QR and the eigenvector/singular-vector bases do most of their work in
   it.
+- Large products go through the right-hand operand in cache blocks of 256 × 512, so a product
+  bigger than the caches runs nearly as fast as one that fits.
 
 `eigh` and `svd` remain about 2× behind. Their reductions to tridiagonal/bidiagonal form are
 still one reflector at a time, and their QR iterations spend most of their time on plane
 rotations. LAPACK replaces both with blocked reductions and divide-and-conquer solvers.
 
-Everything is single-threaded. On this hybrid CPU, multi-threaded OpenBLAS was more than 100× *slower* for
-LU at n = 400 than single-threaded OpenBLAS.
+### Multithreaded
 
-To reproduce, in `bench/` on Windows with Goose on `PATH` (or `$env:GOOSE` set):
+![linalg.parallel against OpenBLAS](docs/benchmark_mt.png)
+
+Times at n = 1600, and the speedups on 6 threads over 1:
+
+| n = 1600 | matmul | det | solve | solve_matrix | inverse | cholesky |
+|---|---|---|---|---|---|---|
+| Goose, 1 thread | 184 ms | 88 ms | 82 ms | 287 ms | 258 ms | 51 ms |
+| Goose, 6 threads | 68 ms | 67 ms | 64 ms | 219 ms | 195 ms | 49 ms |
+| speedup | **2.7×** | 1.3× | 1.3× | 1.3× | 1.3× | 1.0× |
+| OpenBLAS, 1 thread | 121 ms | 53 ms | 54 ms | 199 ms | 194 ms | 40 ms |
+| OpenBLAS, 6 threads | 24 ms | 18 ms | 54 ms | 62 ms | 57 ms | 26 ms |
+| speedup | 5.0× | 2.9× | 1.0× | 3.2× | 3.4× | 1.6× |
+
+On one thread Goose is 1.3–1.7× behind OpenBLAS at this size. On six it is 1.2–3.7× behind,
+because OpenBLAS's threads share the matrix in memory while Goose's copy their share of it. At
+n ≤ 800 only `matmul` gains (1.8× at n = 800); everything else runs serially there, at serial
+speed.
+
+### Reproducing
+
+In `bench/` on Windows, with Goose on `PATH` (or `$env:GOOSE` set):
 
 ```bash
 powershell -File run_pinned.ps1
@@ -145,9 +227,14 @@ powershell -File run_pinned.ps1
 ```bash
 python compare.py
 ```
+```bash
+python compare_mt.py
+```
 
-`run_pinned.ps1` builds the benchmark three ways (plain `/O2`, production flags and `/fp:fast` for
-reference) and runs each, plus OpenBLAS, pinned to one core.
+`run_pinned.ps1` builds the single-threaded benchmark three ways (plain `/O2`, production flags,
+and `/fp:fast` for reference) and the multithreaded one with production flags. It runs each,
+plus OpenBLAS on one and on six threads, pinned as above; `-Core`, `-Threads` and `-ThreadMask`
+change the pinning for another machine.
 
 ## Tests
 
@@ -155,24 +242,36 @@ reference) and runs each, plus OpenBLAS, pinned to one core.
 goose test/test_linalg.goose
 ```
 
-The suite runs 1,201 checks and exits 1 on any failure. It has two kinds of checks:
+The suite runs 1,230 checks and exits 1 on any failure. It has these kinds of checks:
 - **Exact cases worked by hand:** the Hilbert inverse, a textbook Cholesky factor, Fibonacci
   through `power`, the path-graph Laplacian spectrum, and Wilkinson's W₂₁⁺, whose eigenvalues come in
   pairs that agree to about 10⁻¹⁴.
 - **SVD edge cases:** matrices that force the bidiagonal QR to split and to deflate, graded
   singular values from 1 down to 10⁻¹⁵, and clustered singular values that only converge with
   the Wilkinson shift.
-- **Blocked sizes:** n = 33, 64 and 97, past the 32-column panels, for every blocked routine,
-  with singular and indefinite matrices whose trouble lies past the first block.
+- **Blocked sizes:** n = 33, 64, 97 and 300, past the 32-column panels and the 256-column
+  outer blocks, for every blocked routine, with singular and indefinite matrices whose trouble
+  lies past the first block; and a product past the matrix-multiply cache blocks.
 - **Identities on random matrices:** checked at sizes 1–29, square, tall and wide. These cover
   `p a = l u`, `q r = a` with `q` orthogonal, `a v = v diag(w)`, `u s vᵀ = a`, the four
   Moore-Penrose conditions, `det(ab) = det(a) det(b)`, and more.
 
-The suite passes in-process, as a native MSVC build, and with production flags. It was also
-mutation-tested: 67 bugs were planted in the library one at a time, and every one was caught.
-They covered `gemm_acc`, the blocked LU, Cholesky and QR panels, the compact-WY helpers, the
-reflector-based U, V and eigenvector bases, every branch of the Golub-Kahan iteration,
-`tred2`/`tql2`, and the `dot` lanes.
+The parallel module has its own suite, which needs a native build:
+
+```bash
+goose build test/test_parallel.goose && test/test_parallel
+```
+
+Its 237 checks require every `_mt` result to equal the serial one bit for bit, at 1, 2, 3, 5 and 6
+threads, through both ways of sharing a product (by rows and by columns), across a pool restart
+and a resize. They also check that large products go to the pool and small ones don't.
+
+Both suites pass as native MSVC builds, plain and with production flags, and the serial one also
+in-process. They were also mutation-tested: 99 bugs were planted one at a time, 78 in the library
+and 21 in the parallel module, and every one was caught. They covered `gemm_acc` and its cache
+blocks, the two-level LU, solves and Cholesky, the compact-WY helpers, every branch of the
+Golub-Kahan iteration, `tred2`/`tql2`, the `dot` lanes, and, in the parallel module, the row and
+column shares, copying results back, the cost model and the pool.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.
 

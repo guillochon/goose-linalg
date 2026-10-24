@@ -196,12 +196,15 @@ fn transpose(a) -> matrix {
 }
 
 // a * b.
-fn matmul(a, b) -> matrix {
+fn matmul_with<G>(a, b) -> matrix {
     assert(a.cols == b.rows);
     var c = zeros(a.rows, b.cols);
-    gemm_acc(c, 0, 0, a, 0, 0, false, b, 0, 0, a.rows, b.cols, a.cols, 1.0);
+    G(c, 0, 0, a, 0, 0, false, b, 0, 0, a.rows, b.cols, a.cols, 1.0);
     return c;
 }
+
+// matmul_with on this thread: the kernel is gemm_acc.
+fn matmul(a, b) -> matrix { return matmul_with(a, b, gemm_acc); }
 
 // The one matrix-multiply kernel, on blocks of matrices:
 //   c[ci + i][cj + j] += alpha * sum over t of A(i, t) * b[bi + t][bj + j]
@@ -209,12 +212,41 @@ fn matmul(a, b) -> matrix {
 // a[ai + t][aj + i] with trans_a. The blocks may lie in one matrix as long
 // as c's block overlaps neither of the others.
 //
-// Loops run i-k-j, so the innermost runs along rows of c and b. Four rows
-// of c and four rows of b at a time: each element of b loaded feeds four
-// rows of c, and each pass over a row of c folds in four rows of b. The
-// entries of a are scalars here, so a transposed a costs nothing extra.
+// Large products go through b in KC x NC blocks that stay in cache, each
+// block feeding every row of c before the next is loaded. KC is a multiple
+// of four, so the blocks change no sum's order: the result is bit for bit
+// what one pass over all of b gives.
 fn gemm_acc(c: matrix&, ci: i64, cj: i64, a, ai: i64, aj: i64, trans_a: bool,
             b, bi: i64, bj: i64, m: i64, n: i64, k: i64, alpha: f64) {
+    var j0 = 0;
+    while j0 < n || j0 == 0 {
+        let nb = min(NC, n - j0);
+        var t0 = 0;
+        while t0 < k || t0 == 0 {
+            let kb = min(KC, k - t0);
+            if trans_a {
+                gemm_block(c, ci, cj + j0, a, ai + t0, aj, true, b, bi + t0, bj + j0, m, nb, kb, alpha);
+            } else {
+                gemm_block(c, ci, cj + j0, a, ai, aj + t0, false, b, bi + t0, bj + j0, m, nb, kb, alpha);
+            }
+            t0 += KC;
+        }
+        j0 += NC;
+    }
+}
+
+// The cache blocks of gemm_acc: KC steps of the inner dimension by NC
+// columns, 256 x 512 doubles, a megabyte.
+let KC = 256;
+let NC = 512;
+
+// gemm_acc on one cache block. Loops run i-k-j, so the innermost runs along
+// rows of c and b. Four rows of c and four rows of b at a time: each element
+// of b loaded feeds four rows of c, and each pass over a row of c folds in
+// four rows of b. The entries of a are scalars here, so a transposed a
+// costs nothing extra.
+fn gemm_block(c: matrix&, ci: i64, cj: i64, a, ai: i64, aj: i64, trans_a: bool,
+              b, bi: i64, bj: i64, m: i64, n: i64, k: i64, alpha: f64) {
     assert(m >= 0 && n >= 0 && k >= 0);
     assert(ci + m <= c.rows && cj + n <= c.cols && bi + k <= b.rows && bj + n <= b.cols);
     if trans_a { assert(ai + k <= a.rows && aj + m <= a.cols); } else { assert(ai + m <= a.rows && aj + k <= a.cols); }
@@ -507,10 +539,12 @@ let NB = 32;
 // piv[i] of the original. Returns the permutation's sign, and false when a
 // is singular (a zero pivot column); the factors are then incomplete.
 //
-// Blocked, as LAPACK's getrf: factor a panel of NB columns, solve for the
-// matching block row of U, then update the whole trailing matrix with one
-// gemm_acc, where most of the work happens.
-fn lu_factor(a: matrix&, piv: i64[>..]&) -> f64, bool {
+// Blocked twice, as LAPACK's getrf: an outer block of OB columns is
+// factored a panel of NB columns at a time, each panel solving for its
+// block row of U and updating the rest of the outer block with gemm_acc;
+// then the outer block solves for its own block row of U and updates the
+// whole trailing matrix with one G product, where most of the work is.
+fn lu_factor_with<G>(a: matrix&, piv: i64[>..]&) -> f64, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     piv.clear();
@@ -520,59 +554,83 @@ fn lu_factor(a: matrix&, piv: i64[>..]&) -> f64, bool {
     // Below a few panels' width, blocking costs more than it saves: one
     // panel covering the matrix is the unblocked algorithm.
     let nb = if n <= 2 * NB { max(n, 1) } else { NB };
-    var k0 = 0;
-    while k0 < n {
-        let k1 = min(k0 + nb, n);
-        // The panel, columns k0..k1, updated only inside itself.
-        for k in k0..k1 {
-            var p = k;
-            var big = abs(a.data[k * n + k]);
-            for i in k + 1..n {
-                let v = abs(a.data[i * n + k]);
-                if v > big { big = v; p = i; }
-            }
-            if big == 0.0 { ok = false; continue; }
-            // Row slices with their lengths asserted: the inner loops then
-            // run without bounds checks, and the C compiler vectorizes them.
-            let rk = a.data[k * n..(k + 1) * n];
-            assert(rk.len == n);
-            if p != k {
-                // Whole rows: the L to the left and the columns to the right.
-                let rp = a.data[p * n..(p + 1) * n];
-                assert(rp.len == n);
-                for j in n {
-                    let t = rk[j];
-                    rk[j] = rp[j];
-                    rp[j] = t;
+    var o0 = 0;
+    while o0 < n {
+        let o1 = min(o0 + OB, n);
+        var k0 = o0;
+        while k0 < o1 {
+            let k1 = min(k0 + nb, o1);
+            // The panel, columns k0..k1, updated only inside itself.
+            for k in k0..k1 {
+                var p = k;
+                var big = abs(a.data[k * n + k]);
+                for i in k + 1..n {
+                    let v = abs(a.data[i * n + k]);
+                    if v > big { big = v; p = i; }
                 }
-                let t = piv[k];
-                piv[k] = piv[p];
-                piv[p] = t;
-                sign = -sign;
+                if big == 0.0 { ok = false; continue; }
+                // Row slices with their lengths asserted: the inner loops then
+                // run without bounds checks, and the C compiler vectorizes them.
+                let rk = a.data[k * n..(k + 1) * n];
+                assert(rk.len == n);
+                if p != k {
+                    // Whole rows: the L to the left and the columns to the right.
+                    let rp = a.data[p * n..(p + 1) * n];
+                    assert(rp.len == n);
+                    for j in n {
+                        let t = rk[j];
+                        rk[j] = rp[j];
+                        rp[j] = t;
+                    }
+                    let t = piv[k];
+                    piv[k] = piv[p];
+                    piv[p] = t;
+                    sign = -sign;
+                }
+                let pivot = rk[k];
+                for i in k + 1..n {
+                    let ri = a.data[i * n..(i + 1) * n];
+                    assert(ri.len == n);
+                    let f = ri[k] / pivot;
+                    ri[k] = f;
+                    axpy(-f, rk[k + 1..k1], ri[k + 1..k1]);
+                }
             }
-            let pivot = rk[k];
-            for i in k + 1..n {
-                let ri = a.data[i * n..(i + 1) * n];
-                assert(ri.len == n);
-                let f = ri[k] / pivot;
-                ri[k] = f;
-                axpy(-f, rk[k + 1..k1], ri[k + 1..k1]);
+            if k1 < o1 {
+                // The panel's block row of U, within the outer block: the unit
+                // lower panel's inverse applied to columns k1..o1 of its rows.
+                for i in k0..k1 {
+                    let ri = row(a, i)[k1..o1];
+                    for t in k0..i { axpy(-a.data[i * n + t], row(a, t)[k1..o1], ri); }
+                }
+                // The rest of the outer block: a22 -= l21 u12.
+                gemm_acc(a, k1, k1, a, k1, k0, false, a, k0, k1, n - k1, o1 - k1, k1 - k0, -1.0);
             }
+            k0 = k1;
         }
-        if k1 < n {
-            // The block row of U: the unit lower panel's inverse applied to
-            // columns k1.. of the panel's rows.
-            for i in k0..k1 {
-                let ri = row(a, i)[k1..];
-                for t in k0..i { axpy(-a.data[i * n + t], row(a, t)[k1..], ri); }
+        if o1 < n {
+            // The outer block row of U, columns o1..: the unit lower triangle of
+            // the outer block's inverse, NB rows at a time.
+            var i0 = o0;
+            while i0 < o1 {
+                let i1 = min(i0 + nb, o1);
+                gemm_acc(a, i0, o1, a, i0, o0, false, a, o0, o1, i1 - i0, n - o1, i0 - o0, -1.0);
+                for i in i0..i1 {
+                    let ri = row(a, i)[o1..];
+                    for t in i0..i { axpy(-a.data[i * n + t], row(a, t)[o1..], ri); }
+                }
+                i0 = i1;
             }
-            // The trailing matrix: a22 -= l21 u12.
-            gemm_acc(a, k1, k1, a, k1, k0, false, a, k0, k1, n - k1, n - k1, k1 - k0, -1.0);
+            // The trailing matrix: a22 -= l21 u12, OB deep.
+            G(a, o1, o1, a, o1, o0, false, a, o0, o1, n - o1, n - o1, o1 - o0, -1.0);
         }
-        k0 = k1;
+        o0 = o1;
     }
     return sign, ok;
 }
+
+// lu_factor_with on this thread: the kernel is gemm_acc.
+fn lu_factor(a: matrix&, piv: i64[>..]&) -> f64, bool { return lu_factor_with(a, piv, gemm_acc); }
 
 // Solves a x = b given lu_factor's output for a.
 fn lu_solve(lu, piv: i64[:], b: f64[:]) -> f64[>..] {
@@ -583,111 +641,131 @@ fn lu_solve(lu, piv: i64[:], b: f64[:]) -> f64[>..] {
     return solve_upper(lu, y);
 }
 
-fn det(a) -> f64 {
+fn det_with<G>(a) -> f64 {
     assert(a.rows == a.cols);
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor(lu, piv);
+    let sign, ok = lu_factor_with(lu, piv, G);
     guard ok else { return 0.0; }
     var d = sign;
     for i in a.rows { d *= lu.data[i * a.rows + i]; }
     return d;
 }
 
+// det_with on this thread: the kernel is gemm_acc.
+fn det(a) -> f64 { return det_with(a, gemm_acc); }
+
 // Solves a x = b for square a; false when a is singular.
-fn solve(a, b: f64[:]) -> f64[>..], bool {
+fn solve_with<G>(a, b: f64[:]) -> f64[>..], bool {
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor(lu, piv);
+    let sign, ok = lu_factor_with(lu, piv, G);
     guard ok else { return [], false; }
     return lu_solve(lu, piv, b), true;
+}
+
+// solve_with on this thread: the kernel is gemm_acc.
+fn solve(a, b: f64[:]) -> f64[>..], bool { return solve_with(a, b, gemm_acc); }
+
+// The outer block of the two-level factorizations and solves: products
+// this wide in their inner dimension go through G, the kernel the caller
+// chose; the NB-wide work inside an outer block stays on gemm_acc.
+let OB = 256;
+
+// x = l^-1 x for the unit lower triangle of lu, all of x's columns. Rows go
+// in outer blocks of OB, each first taking every row solved above it in one
+// G product, then in inner blocks of NB, each taking the rows above it in
+// its outer block in one gemm_acc product, then row by row. With tri, x
+// starts out as the identity, and row i of the result is zero past column i
+// (the forward half of inverse), which every step skips.
+fn forward_unit_with<G>(lu, x: matrix&, tri: bool) {
+    let n = x.rows;
+    let m = x.cols;
+    fn width(r: i64) -> i64 { if tri { r } else { m } }
+    var o0 = 0;
+    while o0 < n {
+        let o1 = min(o0 + OB, n);
+        G(x, o0, 0, lu, o0, 0, false, x, 0, 0, o1 - o0, width(o0), o0, -1.0);
+        var i0 = o0;
+        while i0 < o1 {
+            let i1 = min(i0 + NB, o1);
+            gemm_acc(x, i0, 0, lu, i0, o0, false, x, o0, 0, i1 - i0, width(i0), i0 - o0, -1.0);
+            for i in i0..i1 {
+                let li = row(lu, i);
+                let xi = row(x, i);
+                for k in i0..i {
+                    let w = if tri { k + 1 } else { m };
+                    axpy(-li[k], row(x, k)[..w], xi[..w]);
+                }
+            }
+            i0 = i1;
+        }
+        o0 = o1;
+    }
+}
+
+// x = u^-1 x for the upper triangle of lu, blocked as forward_unit_with
+// from the bottom up.
+fn backward_with<G>(lu, x: matrix&) {
+    let n = x.rows;
+    let m = x.cols;
+    var o1 = n;
+    while o1 > 0 {
+        let o0 = max(o1 - OB, 0);
+        G(x, o0, 0, lu, o0, o1, false, x, o1, 0, o1 - o0, m, n - o1, -1.0);
+        var j1 = o1;
+        while j1 > o0 {
+            let j0 = max(j1 - NB, o0);
+            gemm_acc(x, j0, 0, lu, j0, j1, false, x, j1, 0, j1 - j0, m, o1 - j1, -1.0);
+            for ii in j1 - j0 {
+                let i = j1 - 1 - ii;
+                let ui = row(lu, i);
+                let xi = row(x, i);
+                assert(ui.len == n);
+                for k in i + 1..j1 { axpy(-ui[k], row(x, k), xi); }
+                let d = ui[i];
+                for &v in xi { v /= d; }
+            }
+            j1 = j0;
+        }
+        o1 = o0;
+    }
 }
 
 // Solves a x = b for every column of b at once. The substitutions work on
 // whole rows of right-hand sides: row i of x takes a multiple of each row
 // solved before it, so every inner loop runs along a row.
-fn solve_matrix(a, b) -> matrix, bool {
+fn solve_matrix_with<G>(a, b) -> matrix, bool {
     assert(a.rows == a.cols && a.rows == b.rows);
     let n = a.rows;
     let m = b.cols;
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor(lu, piv);
+    let sign, ok = lu_factor_with(lu, piv, G);
     guard ok else { return zeros(0, 0), false; }
     var x = zeros(n, m);
     for i in n { set_block(x, i, 0, submatrix(b, piv[i], piv[i] + 1, 0, m)); }
-    // l y = p b, l with a unit diagonal, NB rows at a time: a block first
-    // takes the rows solved above it with one gemm_acc, then is solved
-    // within itself.
-    var i0 = 0;
-    while i0 < n {
-        let i1 = min(i0 + NB, n);
-        gemm_acc(x, i0, 0, lu, i0, 0, false, x, 0, 0, i1 - i0, m, i0, -1.0);
-        for i in i0..i1 {
-            let li = row(lu, i);
-            let xi = row(x, i);
-            for k in i0..i { axpy(-li[k], row(x, k), xi); }
-        }
-        i0 = i1;
-    }
-    // u x = y, blocks from the bottom up.
-    var j1 = n;
-    while j1 > 0 {
-        let j0 = max(j1 - NB, 0);
-        gemm_acc(x, j0, 0, lu, j0, j1, false, x, j1, 0, j1 - j0, m, n - j1, -1.0);
-        for ii in j1 - j0 {
-            let i = j1 - 1 - ii;
-            let ui = row(lu, i);
-            let xi = row(x, i);
-            assert(ui.len == n);
-            for k in i + 1..j1 { axpy(-ui[k], row(x, k), xi); }
-            let d = ui[i];
-            for &v in xi { v /= d; }
-        }
-        j1 = j0;
-    }
+    forward_unit_with(lu, x, false, G);    // l y = p b
+    backward_with(lu, x, G);               // u x = y
     return x, true;
 }
+
+// solve_matrix_with on this thread: the kernel is gemm_acc.
+fn solve_matrix(a, b) -> matrix, bool { return solve_matrix_with(a, b, gemm_acc); }
 
 // With p a = l u, a^-1 = u^-1 l^-1 p. l^-1 is lower triangular, so the
 // forward pass skips the columns it knows are zero: about 2n^3 flops in all
 // where solving against the identity would take 8n^3/3.
-fn inverse(a) -> matrix, bool {
+fn inverse_with<G>(a) -> matrix, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor(lu, piv);
+    let sign, ok = lu_factor_with(lu, piv, G);
     guard ok else { return zeros(0, 0), false; }
-    // x = l^-1: row i is zero past column i.
     var x = identity(n);
-    var i0 = 0;
-    while i0 < n {
-        let i1 = min(i0 + NB, n);
-        gemm_acc(x, i0, 0, lu, i0, 0, false, x, 0, 0, i1 - i0, i0, i0, -1.0);
-        for i in i0..i1 {
-            let li = row(lu, i);
-            let xi = row(x, i);
-            for k in i0..i { axpy(-li[k], row(x, k)[..k + 1], xi[..k + 1]); }
-        }
-        i0 = i1;
-    }
-    // x = u^-1 x, blocks from the bottom up, as in solve_matrix.
-    var j1 = n;
-    while j1 > 0 {
-        let j0 = max(j1 - NB, 0);
-        gemm_acc(x, j0, 0, lu, j0, j1, false, x, j1, 0, j1 - j0, n, n - j1, -1.0);
-        for ii in j1 - j0 {
-            let i = j1 - 1 - ii;
-            let ui = row(lu, i);
-            let xi = row(x, i);
-            assert(ui.len == n);
-            for k in i + 1..j1 { axpy(-ui[k], row(x, k), xi); }
-            let d = ui[i];
-            for &v in xi { v /= d; }
-        }
-        j1 = j0;
-    }
+    forward_unit_with(lu, x, true, G);     // x = l^-1
+    backward_with(lu, x, G);               // x = u^-1 l^-1
     // Times p: column i of x is column piv[i] of the inverse.
     var inv = zeros(n, n);
     for r in n {
@@ -699,16 +777,21 @@ fn inverse(a) -> matrix, bool {
     return inv, true;
 }
 
+// inverse_with on this thread: the kernel is gemm_acc.
+fn inverse(a) -> matrix, bool { return inverse_with(a, gemm_acc); }
+
 // ---------------------------------------------------------------------------
 // Cholesky decomposition
 
 // The lower-triangular l with l l^T = a, for symmetric positive definite a
 // (only its lower triangle is read); false when a is not positive definite.
 //
-// Blocked, as LAPACK's potrf: NB columns at a time, factor the diagonal
-// block and the panel below it, then subtract the panel's outer product from
-// the trailing matrix with gemm_acc.
-fn cholesky(a) -> matrix, bool {
+// Blocked twice, as LAPACK's potrf: within an outer block of OB columns,
+// NB columns at a time, factor the diagonal block and the panel below it,
+// then subtract the panel's outer product from the rest of the outer block
+// with gemm_acc; then subtract the outer block's outer product from the
+// whole trailing matrix with G.
+fn cholesky_with<G>(a) -> matrix, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     var l = zeros(n, n);
@@ -719,44 +802,35 @@ fn cholesky(a) -> matrix, bool {
         for j in i + 1 { li[j] = ai[j]; }
     }
     var ok = true;
-    var k0 = 0;
-    while k0 < n && ok {
-        let k1 = min(k0 + NB, n);
-        // The panel, columns k0..k1. Entry (i, j) is the trailing value less
-        // a dot product of rows i and j of l, from column k0 up to j.
-        for j in k0..k1 {
-            let lj = row(l, j);
-            assert(lj.len == n);
-            let head = lj[k0..j];
-            let d = lj[j] - dot(head, head);
-            if d <= 0.0 || d != d { ok = false; break; }
-            let ljj = sqrt(d);
-            lj[j] = ljj;
-            for i in j + 1..n {
-                let li = row(l, i);
-                assert(li.len == n);
-                li[j] = (li[j] - dot(li[k0..j], head)) / ljj;
+    var o0 = 0;
+    while o0 < n && ok {
+        let o1 = min(o0 + OB, n);
+        var k0 = o0;
+        while k0 < o1 && ok {
+            let k1 = min(k0 + NB, o1);
+            // The panel, columns k0..k1. Entry (i, j) is the trailing value
+            // less a dot product of rows i and j of l, from column k0 up to j.
+            for j in k0..k1 {
+                let lj = row(l, j);
+                assert(lj.len == n);
+                let head = lj[k0..j];
+                let d = lj[j] - dot(head, head);
+                if d <= 0.0 || d != d { ok = false; break; }
+                let ljj = sqrt(d);
+                lj[j] = ljj;
+                for i in j + 1..n {
+                    let li = row(l, i);
+                    assert(li.len == n);
+                    li[j] = (li[j] - dot(li[k0..j], head)) / ljj;
+                }
             }
+            // The rest of the outer block's columns: a -= l21 l21^T.
+            if ok && k1 < o1 { cholesky_update(l, k0, k1, k1, o1, NB, gemm_acc); }
+            k0 = k1;
         }
-        if ok && k1 < n {
-            // a22 -= l21 l21^T, lower triangle only: gemm_acc wants its right
-            // factor by rows, so l21^T is copied out once.
-            let m = n - k1;
-            var lt = zeros(k1 - k0, m);
-            for i in m {
-                let li = row(l, k1 + i);
-                for t in k1 - k0 { lt.data[t * m + i] = li[k0 + t]; }
-            }
-            // Strips of rows, each stopping at its last row's diagonal. The
-            // few entries above the diagonal they touch are cleared below.
-            var s0 = k1;
-            while s0 < n {
-                let s1 = min(s0 + NB, n);
-                gemm_acc(l, s0, k1, l, s0, k0, false, lt, 0, 0, s1 - s0, s1 - k1, k1 - k0, -1.0);
-                s0 = s1;
-            }
-        }
-        k0 = k1;
+        // The whole trailing matrix, OB deep, in strips tall enough to share.
+        if ok && o1 < n { cholesky_update(l, o0, o1, o1, n, OB, G); }
+        o0 = o1;
     }
     for i in n {
         let li = row(l, i);
@@ -764,6 +838,31 @@ fn cholesky(a) -> matrix, bool {
     }
     return l, ok;
 }
+
+// Subtracts l[r.., k0..k1] l[r.., k0..k1]^T from the lower triangle of
+// rows r.. and columns r..c1 of l, for rows r..l.rows, with kernel G.
+// gemm_acc wants its right factor by rows, so the panel's transpose is
+// copied out once. Strips of `strip` rows each stop at their last row's
+// diagonal (or c1); cholesky_with clears the few entries above the diagonal
+// they touch.
+fn cholesky_update<G>(l: matrix&, k0: i64, k1: i64, r: i64, c1: i64, strip: i64) {
+    let n = l.rows;
+    let m = n - r;
+    var lt = zeros(k1 - k0, m);
+    for i in m {
+        let li = row(l, r + i);
+        for t in k1 - k0 { lt.data[t * m + i] = li[k0 + t]; }
+    }
+    var s0 = r;
+    while s0 < n {
+        let s1 = min(s0 + strip, n);
+        G(l, s0, r, l, s0, k0, false, lt, 0, 0, s1 - s0, min(s1, c1) - r, k1 - k0, -1.0);
+        s0 = s1;
+    }
+}
+
+// cholesky_with on this thread: the kernel is gemm_acc.
+fn cholesky(a) -> matrix, bool { return cholesky_with(a, gemm_acc); }
 
 // Solves a x = b given a's Cholesky factor l.
 fn cholesky_solve(l, b: f64[:]) -> f64[>..] {
@@ -913,6 +1012,7 @@ fn form_from_reflectors(q: matrix&, vs: matrix&, tau: f64[:], off: i64, tt: matr
         gemm_acc(q, r0, r0, vs, r0, b0, false, wb, 0, 0, m - r0, nc, kb, -1.0);
     }
 }
+
 
 // wb = T wb, or T^T wb with trans, in place, for the kb x kb upper
 // triangular T in rows k0..k0 + kb of tt. Rows are combined in the order
@@ -1480,6 +1580,7 @@ fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     v = transpose(vt);
     return converged;
 }
+
 
 fn singular_values(a) -> f64[>..] {
     var u = zeros(0, 0);

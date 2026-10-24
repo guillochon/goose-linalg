@@ -6,8 +6,9 @@ The headline comparison is production against production: Goose built with
 /arch:AVX2 /fp:contract (bench_goose_avx2.csv) against single-threaded
 OpenBLAS (bench_lapack_1t.csv), both pinned to one P-core. Other runs are
 shown when their CSVs exist: bench_goose_prev_avx2.csv (an earlier version,
-same flags; in the table always, in the chart only with --with-prev), bench_goose_base.csv (plain /O2), bench_goose_fast.csv
-(/fp:fast, reference only) and bench_lapack_mt.csv (all cores).
+same flags; in the table always, in the chart only with --with-prev),
+bench_goose_base.csv (plain /O2) and bench_goose_fast.csv (/fp:fast,
+reference only). The multithreaded comparison is compare_mt.py's.
 """
 import csv
 import os
@@ -31,7 +32,6 @@ chart_prev = prev if "--with-prev" in sys.argv else None
 base = load("bench_goose_base.csv")
 fast = load("bench_goose_fast.csv")
 one = load("bench_lapack_1t.csv")
-multi = load("bench_lapack_mt.csv")
 ops = ["matmul", "matvec", "solve", "det", "inverse", "cholesky", "qr", "eigh", "svd"]
 sizes = sorted({n for _, n in now})
 
@@ -69,7 +69,7 @@ ax[0].legend(ncol=3, fontsize=8)
 
 n = sizes[-1]
 series = [(name, data) for name, data in [("Goose, earlier version", chart_prev), ("Goose linalg", now),
-                                          ("OpenBLAS, 1 thread", one), ("OpenBLAS, 16 threads", multi)] if data]
+                                          ("OpenBLAS, 1 thread", one)] if data]
 w = 0.8 / len(series)
 for s, (name, data) in enumerate(series):
     ax[1].bar([i + (s - (len(series) - 1) / 2) * w for i in range(len(ops))],

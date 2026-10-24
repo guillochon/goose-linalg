@@ -3,17 +3,25 @@
     python bench/bench_lapack.py [label]      -> bench_<label>.csv (default "lapack")
 
 Set OPENBLAS_NUM_THREADS=1 before running for a single-threaded comparison.
+BENCH_SIZES=400,800,1600 changes the sizes; BENCH_OPS=matmul,solve,... the
+operations (the CSV then also gets a threads column, from
+OPENBLAS_NUM_THREADS, for compare_mt.py).
 The same timing rule as the Goose side: best of at least 3 runs and 0.3 s.
 """
+import os
 import sys
 import time
 import numpy as np
 
-SIZES = [50, 100, 200, 400]
+SIZES = [int(v) for v in os.environ.get("BENCH_SIZES", "50,100,200,400").split(",")]
+OPS = os.environ.get("BENCH_OPS", "").split(",") if os.environ.get("BENCH_OPS") else None
+THREADS = os.environ.get("OPENBLAS_NUM_THREADS", "")
 label = sys.argv[1] if len(sys.argv) > 1 else "lapack"
 
 
 def time_it(op, n, f):
+    if OPS and op not in OPS:
+        return
     best, total, reps = float("inf"), 0.0, 0
     while (reps < 3 and total < 5.0) or total < 0.3:
         t0 = time.perf_counter()
@@ -35,6 +43,7 @@ for n in SIZES:
     time_it("matmul", n, lambda: a @ b)                             # dgemm
     time_it("matvec", n, lambda: a @ x)                             # dgemv
     time_it("solve", n, lambda: np.linalg.solve(a, x))              # dgesv
+    time_it("solve_matrix", n, lambda: np.linalg.solve(a, b))       # dgesv, n right-hand sides
     time_it("det", n, lambda: np.linalg.det(a))                     # dgetrf
     time_it("inverse", n, lambda: np.linalg.inv(a))                 # dgesv on I
     time_it("cholesky", n, lambda: np.linalg.cholesky(spd))         # dpotrf
@@ -43,6 +52,11 @@ for n in SIZES:
     time_it("svd", n, lambda: np.linalg.svd(a, full_matrices=False))  # dgesdd
 
 with open(f"bench_{label}.csv", "w") as f:
-    f.write("op,n,seconds\n")
-    for op, n, s in rows:
-        f.write(f"{op},{n},{s}\n")
+    if OPS:
+        f.write("op,n,threads,seconds\n")
+        for op, n, secs in rows:
+            f.write(f"{op},{n},{THREADS or 0},{secs}\n")
+    else:
+        f.write("op,n,seconds\n")
+        for op, n, secs in rows:
+            f.write(f"{op},{n},{secs}\n")
