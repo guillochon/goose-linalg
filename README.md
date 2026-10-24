@@ -4,7 +4,7 @@ Dense real linear algebra for [Goose](https://aardappel.github.io/goose/), in pu
 build step, nothing to install.
 
 ```goose
-import linalg from "you/linalg@v0.1";     // or from "../linalg" for a local checkout
+import linalg from "guillochon/goose-linalg@main";     // or from "../goose-linalg" for a local checkout
 
 fn main() {
     let a = linalg::from_rows(3, 3, [4, 1, 2, 1, 3, 0, 2, 0, 5]);
@@ -12,6 +12,10 @@ fn main() {
     print(a, " det ", linalg::det(a), " x ", x);
 }
 ```
+
+Goose fetches the package the first time a program uses it. A branch like `@main` is pinned at
+whatever was fetched first, until `goose fetch --update`. For reproducible builds, pin a commit
+instead: `"guillochon/goose-linalg@<commit>"`.
 
 ## Conventions
 
@@ -141,3 +145,8 @@ mutation-tested: 36 bugs were planted in the library one at a time, and every on
 They covered the blocked `matmul`, the `dot` lanes, `tred2`/`tql2` and the multi-RHS solve.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.
+
+## License
+
+Apache-2.0, the same license as Goose itself (see `LICENSE`). The symmetric eigensolver is a port of
+the public-domain JAMA library's `tred2`/`tql2`, which in turn derive from EISPACK.
