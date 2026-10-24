@@ -783,6 +783,91 @@ fn test_svd() {
     }
 }
 
+// Sizes past the blocked algorithms' panel width (32): one column over a
+// block, exactly two blocks, and three blocks plus a remainder.
+fn test_blocked() {
+    group("blocked sizes");
+    var g = rng { 23 };
+    for n in [33, 64, 97] {
+        let t = 1.0e-13 * n;
+        let a = linalg::random(n, n, g);
+        // p a = l u.
+        var lu = linalg::clone(a);
+        var piv: i64[>..] = [];
+        let sign, ok = linalg::lu_factor(lu, piv);
+        check(ok, str("lu ok, n=", n));
+        var pm = linalg::zeros(n, n);
+        var l = linalg::identity(n);
+        var u = linalg::zeros(n, n);
+        for i in n {
+            linalg::set(pm, i, piv[i], 1.0);
+            for j in n {
+                if j < i { linalg::set(l, i, j, linalg::at(lu, i, j)); } else { linalg::set(u, i, j, linalg::at(lu, i, j)); }
+            }
+        }
+        check_mat(linalg::matmul(pm, a), linalg::matmul(l, u), t, str("p a = l u, n=", n));
+        check_close(linalg::det(pm), sign, 0.0, str("sign is det(p), n=", n));
+        var bounded = true;
+        for i in n { for j in i { bounded = bounded && abs(linalg::at(l, i, j)) <= 1.0; } }
+        check(bounded, str("partial pivoting keeps |l| <= 1, n=", n));
+        // Inverse and multi-RHS solve.
+        let c = linalg::cond(a);
+        let inv, iok = linalg::inverse(a);
+        check(iok, str("inverse ok, n=", n));
+        check_mat(linalg::matmul(a, inv), linalg::identity(n), t * c, str("a inv = I, n=", n));
+        check_mat(linalg::matmul(inv, a), linalg::identity(n), t * c, str("inv a = I, n=", n));
+        let bm = linalg::random(n, 5, g);
+        let xm, mok = linalg::solve_matrix(a, bm);
+        check(mok, str("solve_matrix ok, n=", n));
+        check_mat(linalg::matmul(a, xm), bm, t * c, str("solve_matrix residual, n=", n));
+        let rhs = linalg::col(bm, 0);
+        let x, sok = linalg::solve(a, rhs);
+        check(sok, str("solve ok, n=", n));
+        check_vec(linalg::matvec(a, x), rhs, t * c, str("solve residual, n=", n));
+        // A singular matrix whose zero column sits past the first block.
+        var sing = linalg::clone(a);
+        for i in n { linalg::set(sing, i, n - 1, 0.0); }
+        let sx, sing_ok = linalg::solve(sing, rhs);
+        check(!sing_ok, str("singular past the first block, n=", n));
+        // Cholesky.
+        var spd = linalg::matmul(a, linalg::transpose(a));
+        linalg::add_scaled(spd, n * 1.0, linalg::identity(n));
+        let f, fok = linalg::cholesky(spd);
+        check(fok, str("cholesky ok, n=", n));
+        check(is_lower(f), str("cholesky factor lower, n=", n));
+        check_mat(linalg::matmul(f, linalg::transpose(f)), spd, t * n, str("l l^T = a, n=", n));
+        var notpd = linalg::clone(spd);
+        linalg::set(notpd, n - 1, n - 1, -1.0);
+        let nf, nfok = linalg::cholesky(notpd);
+        check(!nfok, str("not positive definite in the last block, n=", n));
+        // QR, tall and wide.
+        var q = linalg::zeros(0, 0);
+        var r = linalg::zeros(0, 0);
+        for shape in 2 {
+            let m = if shape == 0 { linalg::random(n + 7, n, g) } else { linalg::random(n, n + 7, g) };
+            linalg::qr(m, q, r);
+            check(orthonormal_cols(q, t), str("q orthogonal, ", m.rows, "x", m.cols));
+            check(is_upper(r), str("r upper, ", m.rows, "x", m.cols));
+            check_mat(linalg::matmul(q, r), m, t, str("q r = a, ", m.rows, "x", m.cols));
+        }
+        // Eigen and SVD.
+        let sym = linalg::add(a, linalg::transpose(a));
+        var w: f64[>..] = [];
+        var v = linalg::zeros(0, 0);
+        check(linalg::eigh(sym, w, v), str("eigh converges, n=", n));
+        check(orthonormal_cols(v, t), str("eigh v orthonormal, n=", n));
+        check_mat(linalg::matmul(sym, v), linalg::matmul(v, linalg::diag(w)), t * 10.0, str("eigh a v = v w, n=", n));
+        var su = linalg::zeros(0, 0);
+        var sv = linalg::zeros(0, 0);
+        var ss: f64[>..] = [];
+        let tall = linalg::random(n + 5, n, g);
+        check(linalg::svd(tall, su, ss, sv), str("svd converges, n=", n));
+        check(orthonormal_cols(su, t) && orthonormal_cols(sv, t), str("svd factors orthonormal, n=", n));
+        check_mat(linalg::matmul(linalg::matmul(su, linalg::diag(ss)), linalg::transpose(sv)), tall, t * 10.0,
+                  str("svd u s v^T = a, n=", n));
+    }
+}
+
 // Read-only parameters take temporaries, so expressions nest.
 fn test_composition() {
     group("composition");
@@ -812,6 +897,7 @@ fn main() {
     test_qr();
     test_eigh();
     test_svd();
+    test_blocked();
     test_composition();
     var note: u8[>..] = [];
     format(note, passed + failed, " checks, ", passed, " passed, ", failed, " failed (");

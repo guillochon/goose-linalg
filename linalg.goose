@@ -195,49 +195,65 @@ fn transpose(a) -> matrix {
     return t;
 }
 
-// a * b, in i-k-j order so the inner loop runs along rows of both. Four rows
-// of c and four rows of b at a time: each element of b loaded feeds four
-// rows of c, and each pass over a row of c folds in four rows of b.
+// a * b.
 fn matmul(a, b) -> matrix {
     assert(a.cols == b.rows);
-    let n = b.cols;
-    let kk = a.cols;
-    var c = zeros(a.rows, n);
+    var c = zeros(a.rows, b.cols);
+    gemm_acc(c, 0, 0, a, 0, 0, false, b, 0, 0, a.rows, b.cols, a.cols, 1.0);
+    return c;
+}
+
+// The one matrix-multiply kernel, on blocks of matrices:
+//   c[ci + i][cj + j] += alpha * sum over t of A(i, t) * b[bi + t][bj + j]
+// for i < m, j < n, t < k, where A(i, t) is a[ai + i][aj + t], or
+// a[ai + t][aj + i] with trans_a. The blocks may lie in one matrix as long
+// as c's block overlaps neither of the others.
+//
+// Loops run i-k-j, so the innermost runs along rows of c and b. Four rows
+// of c and four rows of b at a time: each element of b loaded feeds four
+// rows of c, and each pass over a row of c folds in four rows of b. The
+// entries of a are scalars here, so a transposed a costs nothing extra.
+fn gemm_acc(c: matrix&, ci: i64, cj: i64, a, ai: i64, aj: i64, trans_a: bool,
+            b, bi: i64, bj: i64, m: i64, n: i64, k: i64, alpha: f64) {
+    assert(m >= 0 && n >= 0 && k >= 0);
+    assert(ci + m <= c.rows && cj + n <= c.cols && bi + k <= b.rows && bj + n <= b.cols);
+    if trans_a { assert(ai + k <= a.rows && aj + m <= a.cols); } else { assert(ai + m <= a.rows && aj + k <= a.cols); }
+    let lda = a.cols;
+    fn av(i: i64, t: i64) -> f64 {
+        alpha * (if trans_a { a.data[(ai + t) * lda + aj + i] } else { a.data[(ai + i) * lda + aj + t] })
+    }
+    fn crow(i: i64) -> f64[:] { row(c, ci + i)[cj..cj + n] }
+    fn brow(t: i64) -> f64[:] { row(b, bi + t)[bj..bj + n] }
     var i = 0;
-    while i + 4 <= a.rows {
-        let c0 = row(c, i);
-        let c1 = row(c, i + 1);
-        let c2 = row(c, i + 2);
-        let c3 = row(c, i + 3);
-        let a0 = row(a, i);
-        let a1 = row(a, i + 1);
-        let a2 = row(a, i + 2);
-        let a3 = row(a, i + 3);
+    while i + 4 <= m {
+        let c0 = crow(i);
+        let c1 = crow(i + 1);
+        let c2 = crow(i + 2);
+        let c3 = crow(i + 3);
         assert(c0.len == n && c1.len == n && c2.len == n && c3.len == n);
-        assert(a0.len == kk && a1.len == kk && a2.len == kk && a3.len == kk);
-        var k = 0;
-        while k + 4 <= kk {
-            let b0 = row(b, k);
-            let b1 = row(b, k + 1);
-            let b2 = row(b, k + 2);
-            let b3 = row(b, k + 3);
+        var t = 0;
+        while t + 4 <= k {
+            let b0 = brow(t);
+            let b1 = brow(t + 1);
+            let b2 = brow(t + 2);
+            let b3 = brow(t + 3);
             assert(b0.len == n && b1.len == n && b2.len == n && b3.len == n);
-            let p0 = a0[k];
-            let p1 = a0[k + 1];
-            let p2 = a0[k + 2];
-            let p3 = a0[k + 3];
-            let q0 = a1[k];
-            let q1 = a1[k + 1];
-            let q2 = a1[k + 2];
-            let q3 = a1[k + 3];
-            let r0 = a2[k];
-            let r1 = a2[k + 1];
-            let r2 = a2[k + 2];
-            let r3 = a2[k + 3];
-            let s0 = a3[k];
-            let s1 = a3[k + 1];
-            let s2 = a3[k + 2];
-            let s3 = a3[k + 3];
+            let p0 = av(i, t);
+            let p1 = av(i, t + 1);
+            let p2 = av(i, t + 2);
+            let p3 = av(i, t + 3);
+            let q0 = av(i + 1, t);
+            let q1 = av(i + 1, t + 1);
+            let q2 = av(i + 1, t + 2);
+            let q3 = av(i + 1, t + 3);
+            let r0 = av(i + 2, t);
+            let r1 = av(i + 2, t + 1);
+            let r2 = av(i + 2, t + 2);
+            let r3 = av(i + 2, t + 3);
+            let s0 = av(i + 3, t);
+            let s1 = av(i + 3, t + 1);
+            let s2 = av(i + 3, t + 2);
+            let s3 = av(i + 3, t + 3);
             for j in n {
                 let v0 = b0[j];
                 let v1 = b1[j];
@@ -248,35 +264,32 @@ fn matmul(a, b) -> matrix {
                 c2[j] += r0 * v0 + r1 * v1 + r2 * v2 + r3 * v3;
                 c3[j] += s0 * v0 + s1 * v1 + s2 * v2 + s3 * v3;
             }
-            k += 4;
+            t += 4;
         }
-        while k < kk {
-            let bk = row(b, k);
-            assert(bk.len == n);
-            let p = a0[k];
-            let q = a1[k];
-            let r = a2[k];
-            let s = a3[k];
+        while t < k {
+            let bt = brow(t);
+            assert(bt.len == n);
+            let p = av(i, t);
+            let q = av(i + 1, t);
+            let r = av(i + 2, t);
+            let s = av(i + 3, t);
             for j in n {
-                let v = bk[j];
+                let v = bt[j];
                 c0[j] += p * v;
                 c1[j] += q * v;
                 c2[j] += r * v;
                 c3[j] += s * v;
             }
-            k++;
+            t++;
         }
         i += 4;
     }
     // The last rows, one at a time.
-    while i < a.rows {
-        let ci = row(c, i);
-        let ai = row(a, i);
-        assert(ci.len == n && ai.len == kk);
-        for k in kk { axpy(ai[k], row(b, k), ci); }
+    while i < m {
+        let ck = crow(i);
+        for t in k { axpy(av(i, t), brow(t), ck); }
         i++;
     }
-    return c;
 }
 
 // a * x.
@@ -486,10 +499,17 @@ fn solve_upper(u, b: f64[:]) -> f64[>..] {
 // ---------------------------------------------------------------------------
 // LU decomposition with partial pivoting
 
+// The panel width of the blocked factorizations.
+let NB = 32;
+
 // Factors square `a` in place into P a = L U: U on and above the diagonal,
 // L's multipliers below it (L's diagonal is ones), and row i of P a is row
 // piv[i] of the original. Returns the permutation's sign, and false when a
 // is singular (a zero pivot column); the factors are then incomplete.
+//
+// Blocked, as LAPACK's getrf: factor a panel of NB columns, solve for the
+// matching block row of U, then update the whole trailing matrix with one
+// gemm_acc, where most of the work happens.
 fn lu_factor(a: matrix&, piv: i64[>..]&) -> f64, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
@@ -497,39 +517,59 @@ fn lu_factor(a: matrix&, piv: i64[>..]&) -> f64, bool {
     for i in n { piv.push(i); }
     var sign = 1.0;
     var ok = true;
-    for k in n {
-        var p = k;
-        var big = abs(a.data[k * n + k]);
-        for i in k + 1..n {
-            let v = abs(a.data[i * n + k]);
-            if v > big { big = v; p = i; }
-        }
-        if big == 0.0 { ok = false; continue; }
-        // Row slices with their lengths asserted: the inner loops then run
-        // without bounds checks, and the C compiler can vectorize them.
-        let rk = a.data[k * n..(k + 1) * n];
-        assert(rk.len == n);
-        if p != k {
-            let rp = a.data[p * n..(p + 1) * n];
-            assert(rp.len == n);
-            for j in n {
-                let t = rk[j];
-                rk[j] = rp[j];
-                rp[j] = t;
+    // Below a few panels' width, blocking costs more than it saves: one
+    // panel covering the matrix is the unblocked algorithm.
+    let nb = if n <= 2 * NB { max(n, 1) } else { NB };
+    var k0 = 0;
+    while k0 < n {
+        let k1 = min(k0 + nb, n);
+        // The panel, columns k0..k1, updated only inside itself.
+        for k in k0..k1 {
+            var p = k;
+            var big = abs(a.data[k * n + k]);
+            for i in k + 1..n {
+                let v = abs(a.data[i * n + k]);
+                if v > big { big = v; p = i; }
             }
-            let t = piv[k];
-            piv[k] = piv[p];
-            piv[p] = t;
-            sign = -sign;
+            if big == 0.0 { ok = false; continue; }
+            // Row slices with their lengths asserted: the inner loops then
+            // run without bounds checks, and the C compiler vectorizes them.
+            let rk = a.data[k * n..(k + 1) * n];
+            assert(rk.len == n);
+            if p != k {
+                // Whole rows: the L to the left and the columns to the right.
+                let rp = a.data[p * n..(p + 1) * n];
+                assert(rp.len == n);
+                for j in n {
+                    let t = rk[j];
+                    rk[j] = rp[j];
+                    rp[j] = t;
+                }
+                let t = piv[k];
+                piv[k] = piv[p];
+                piv[p] = t;
+                sign = -sign;
+            }
+            let pivot = rk[k];
+            for i in k + 1..n {
+                let ri = a.data[i * n..(i + 1) * n];
+                assert(ri.len == n);
+                let f = ri[k] / pivot;
+                ri[k] = f;
+                axpy(-f, rk[k + 1..k1], ri[k + 1..k1]);
+            }
         }
-        let pivot = rk[k];
-        for i in k + 1..n {
-            let ri = a.data[i * n..(i + 1) * n];
-            assert(ri.len == n);
-            let f = ri[k] / pivot;
-            ri[k] = f;
-            for j in k + 1..n { ri[j] -= f * rk[j]; }
+        if k1 < n {
+            // The block row of U: the unit lower panel's inverse applied to
+            // columns k1.. of the panel's rows.
+            for i in k0..k1 {
+                let ri = row(a, i)[k1..];
+                for t in k0..i { axpy(-a.data[i * n + t], row(a, t)[k1..], ri); }
+            }
+            // The trailing matrix: a22 -= l21 u12.
+            gemm_acc(a, k1, k1, a, k1, k0, false, a, k0, k1, n - k1, n - k1, k1 - k0, -1.0);
         }
+        k0 = k1;
     }
     return sign, ok;
 }
@@ -576,28 +616,87 @@ fn solve_matrix(a, b) -> matrix, bool {
     guard ok else { return zeros(0, 0), false; }
     var x = zeros(n, m);
     for i in n { set_block(x, i, 0, submatrix(b, piv[i], piv[i] + 1, 0, m)); }
-    // l y = p b: l has a unit diagonal.
-    for i in n {
-        let li = row(lu, i);
-        let xi = row(x, i);
-        for k in i { axpy(-li[k], row(x, k), xi); }
+    // l y = p b, l with a unit diagonal, NB rows at a time: a block first
+    // takes the rows solved above it with one gemm_acc, then is solved
+    // within itself.
+    var i0 = 0;
+    while i0 < n {
+        let i1 = min(i0 + NB, n);
+        gemm_acc(x, i0, 0, lu, i0, 0, false, x, 0, 0, i1 - i0, m, i0, -1.0);
+        for i in i0..i1 {
+            let li = row(lu, i);
+            let xi = row(x, i);
+            for k in i0..i { axpy(-li[k], row(x, k), xi); }
+        }
+        i0 = i1;
     }
-    // u x = y, from the bottom row up.
-    for ii in n {
-        let i = n - 1 - ii;
-        let ui = row(lu, i);
-        let xi = row(x, i);
-        assert(ui.len == n);
-        for k in i + 1..n { axpy(-ui[k], row(x, k), xi); }
-        let d = ui[i];
-        for &v in xi { v /= d; }
+    // u x = y, blocks from the bottom up.
+    var j1 = n;
+    while j1 > 0 {
+        let j0 = max(j1 - NB, 0);
+        gemm_acc(x, j0, 0, lu, j0, j1, false, x, j1, 0, j1 - j0, m, n - j1, -1.0);
+        for ii in j1 - j0 {
+            let i = j1 - 1 - ii;
+            let ui = row(lu, i);
+            let xi = row(x, i);
+            assert(ui.len == n);
+            for k in i + 1..j1 { axpy(-ui[k], row(x, k), xi); }
+            let d = ui[i];
+            for &v in xi { v /= d; }
+        }
+        j1 = j0;
     }
     return x, true;
 }
 
+// With p a = l u, a^-1 = u^-1 l^-1 p. l^-1 is lower triangular, so the
+// forward pass skips the columns it knows are zero: about 2n^3 flops in all
+// where solving against the identity would take 8n^3/3.
 fn inverse(a) -> matrix, bool {
     assert(a.rows == a.cols);
-    return solve_matrix(a, identity(a.rows));
+    let n = a.rows;
+    var lu = clone(a);
+    var piv: i64[>..] = [];
+    let sign, ok = lu_factor(lu, piv);
+    guard ok else { return zeros(0, 0), false; }
+    // x = l^-1: row i is zero past column i.
+    var x = identity(n);
+    var i0 = 0;
+    while i0 < n {
+        let i1 = min(i0 + NB, n);
+        gemm_acc(x, i0, 0, lu, i0, 0, false, x, 0, 0, i1 - i0, i0, i0, -1.0);
+        for i in i0..i1 {
+            let li = row(lu, i);
+            let xi = row(x, i);
+            for k in i0..i { axpy(-li[k], row(x, k)[..k + 1], xi[..k + 1]); }
+        }
+        i0 = i1;
+    }
+    // x = u^-1 x, blocks from the bottom up, as in solve_matrix.
+    var j1 = n;
+    while j1 > 0 {
+        let j0 = max(j1 - NB, 0);
+        gemm_acc(x, j0, 0, lu, j0, j1, false, x, j1, 0, j1 - j0, n, n - j1, -1.0);
+        for ii in j1 - j0 {
+            let i = j1 - 1 - ii;
+            let ui = row(lu, i);
+            let xi = row(x, i);
+            assert(ui.len == n);
+            for k in i + 1..j1 { axpy(-ui[k], row(x, k), xi); }
+            let d = ui[i];
+            for &v in xi { v /= d; }
+        }
+        j1 = j0;
+    }
+    // Times p: column i of x is column piv[i] of the inverse.
+    var inv = zeros(n, n);
+    for r in n {
+        let xr = row(x, r);
+        let out = row(inv, r);
+        assert(xr.len == n && out.len == n);
+        for i in n { out[piv[i]] = xr[i]; }
+    }
+    return inv, true;
 }
 
 // ---------------------------------------------------------------------------
@@ -605,25 +704,63 @@ fn inverse(a) -> matrix, bool {
 
 // The lower-triangular l with l l^T = a, for symmetric positive definite a
 // (only its lower triangle is read); false when a is not positive definite.
+//
+// Blocked, as LAPACK's potrf: NB columns at a time, factor the diagonal
+// block and the panel below it, then subtract the panel's outer product from
+// the trailing matrix with gemm_acc.
 fn cholesky(a) -> matrix, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     var l = zeros(n, n);
+    for i in n {
+        let li = row(l, i);
+        let ai = row(a, i);
+        assert(li.len == n && ai.len == n);
+        for j in i + 1 { li[j] = ai[j]; }
+    }
     var ok = true;
-    for j in n {
-        // Entry (i, j) is a dot product of rows i and j of l, up to column j.
-        let lj = l.data[j * n..(j + 1) * n];
-        assert(lj.len == n);
-        let head = lj[..j];
-        let d = a.data[j * n + j] - dot(head, head);
-        if d <= 0.0 || d != d { ok = false; break; }
-        let ljj = sqrt(d);
-        lj[j] = ljj;
-        for i in j + 1..n {
-            let li = l.data[i * n..(i + 1) * n];
-            assert(li.len == n);
-            li[j] = (a.data[i * n + j] - dot(li[..j], head)) / ljj;
+    var k0 = 0;
+    while k0 < n && ok {
+        let k1 = min(k0 + NB, n);
+        // The panel, columns k0..k1. Entry (i, j) is the trailing value less
+        // a dot product of rows i and j of l, from column k0 up to j.
+        for j in k0..k1 {
+            let lj = row(l, j);
+            assert(lj.len == n);
+            let head = lj[k0..j];
+            let d = lj[j] - dot(head, head);
+            if d <= 0.0 || d != d { ok = false; break; }
+            let ljj = sqrt(d);
+            lj[j] = ljj;
+            for i in j + 1..n {
+                let li = row(l, i);
+                assert(li.len == n);
+                li[j] = (li[j] - dot(li[k0..j], head)) / ljj;
+            }
         }
+        if ok && k1 < n {
+            // a22 -= l21 l21^T, lower triangle only: gemm_acc wants its right
+            // factor by rows, so l21^T is copied out once.
+            let m = n - k1;
+            var lt = zeros(k1 - k0, m);
+            for i in m {
+                let li = row(l, k1 + i);
+                for t in k1 - k0 { lt.data[t * m + i] = li[k0 + t]; }
+            }
+            // Strips of rows, each stopping at its last row's diagonal. The
+            // few entries above the diagonal they touch are cleared below.
+            var s0 = k1;
+            while s0 < n {
+                let s1 = min(s0 + NB, n);
+                gemm_acc(l, s0, k1, l, s0, k0, false, lt, 0, 0, s1 - s0, s1 - k1, k1 - k0, -1.0);
+                s0 = s1;
+            }
+        }
+        k0 = k1;
+    }
+    for i in n {
+        let li = row(l, i);
+        for j in i + 1..n { li[j] = 0.0; }
     }
     return l, ok;
 }
@@ -651,44 +788,154 @@ fn cholesky_solve(l, b: f64[:]) -> f64[>..] {
 
 // a = q r by Householder reflections, for any shape: q is rows x rows and
 // orthogonal, r is rows x cols and upper triangular.
+//
+// Blocked with the compact WY form, as LAPACK's geqrf and orgqr: the NB
+// reflectors H = I - tau v v^T of a panel multiply out to I - V T V^T, with
+// V their vectors side by side and T upper triangular. The panel is
+// factored one reflector at a time; the rest of r takes the whole block
+// at once, as two gemm_acc calls. q is formed afterwards from the
+// identity, blocks last first, each touching only the part of q that is
+// no longer the identity.
 fn qr(a, q: matrix&, r: matrix&) {
     let m = a.rows;
     let n = a.cols;
     r = clone(a);
     q = identity(m);
+    let kmax = max(min(m - 1, n), 0);
+    // Reflector k: unit vector in column k of vs, from row k down, and
+    // tau[k] = 2 (0 where column k needed none). Each block's T sits in
+    // rows k0..k1 of tt.
+    var vs = zeros(m, kmax);
+    var tau: f64[>..] = [];
+    tau.resize(kmax, 0.0);
+    var tt = zeros(kmax, NB);
     var v: f64[>..] = [];
     var w: f64[>..] = [];
     w.resize(n, 0.0);
-    for k in min(m - 1, n) {
-        // The reflection that takes r[k.., k] to a multiple of e_k.
-        v.clear();
-        for i in k..m { v.push(r.data[i * n + k]); }
-        let alpha = if v[0] >= 0.0 { -vnorm(v) } else { vnorm(v) };
-        v[0] -= alpha;
-        let vn = vnorm(v);
-        if vn == 0.0 { continue; }
-        for &x in v { x /= vn; }
-        // r[k.., ..] -= 2 v w^T with w^T = v^T r[k.., ..], both passes along rows.
-        assert(w.len == n);
-        for j in k..n { w[j] = 0.0; }
-        for i in k..m {
-            let ri = row(r, i);
-            assert(ri.len == n);
-            let vi = v[i - k];
-            for j in k..n { w[j] += vi * ri[j]; }
+
+    var k0 = 0;
+    while k0 < kmax {
+        let k1 = min(k0 + NB, kmax);
+        let kb = k1 - k0;
+        // The panel, one reflector at a time.
+        for k in k0..k1 {
+            // The reflection that takes r[k.., k] to a multiple of e_k.
+            v.clear();
+            for i in k..m { v.push(r.data[i * n + k]); }
+            let alpha = if v[0] >= 0.0 { -vnorm(v) } else { vnorm(v) };
+            v[0] -= alpha;
+            let vn = vnorm(v);
+            if vn == 0.0 { continue; }
+            for &x in v { x /= vn; }
+            tau[k] = 2.0;
+            for i in k..m { vs.data[i * kmax + k] = v[i - k]; }
+            // r[k.., k..k1] -= 2 v (v^T r[k.., k..k1]), both passes along rows.
+            assert(w.len == n);
+            for &x in w[k..k1] { x = 0.0; }
+            for i in k..m {
+                let ri = row(r, i);
+                assert(ri.len == n);
+                axpy(v[i - k], ri[k..k1], w[k..k1]);
+            }
+            for i in k..m {
+                let ri = row(r, i);
+                assert(ri.len == n);
+                let vi = 2.0 * v[i - k];
+                axpy(-vi, w[k..k1], ri[k..k1]);
+            }
+            for i in k + 1..m { r.data[i * n + k] = 0.0; }
         }
-        for i in k..m {
-            let ri = row(r, i);
-            assert(ri.len == n);
-            let vi = 2.0 * v[i - k];
-            for j in k..n { ri[j] -= vi * w[j]; }
+        householder_t(vs, tau, k0, k1, 0, tt);
+        // The rest of r takes the block's transpose: c -= V (T^T (V^T c)).
+        if k1 < n {
+            let nc = n - k1;
+            var wb = zeros(kb, nc);
+            gemm_acc(wb, 0, 0, vs, k0, k0, true, r, k0, k1, kb, nc, m - k0, 1.0);
+            apply_t(wb, tt, k0, kb, true);
+            gemm_acc(r, k0, k1, vs, k0, k0, false, wb, 0, 0, m - k0, nc, kb, -1.0);
         }
-        // q[.., k..] -= 2 (q[.., k..] v) v^T, accumulating q = H_1 H_2 ...
-        for i in m {
-            let qi = q.data[i * m + k..(i + 1) * m];
-            axpy(-2.0 * dot(qi, v), v, qi);
+        k0 = k1;
+    }
+
+    form_from_reflectors(q, vs, tau, 0, tt);
+}
+
+// The T of the block of reflectors k0..k1 into rows k0..k1 of tt, so that
+// H_k0 ... H_k1-1 = I - V T V^T: column by column,
+// T[..j, j] = -tau_j T[..j, ..j] (V[.., ..j]^T v_j). Reflector k is
+// H_k = I - tau[k] v_k v_k^T with v_k column k of vs, zero above row k + off.
+fn householder_t(vs: matrix&, tau: f64[:], k0: i64, k1: i64, off: i64, tt: matrix&) {
+    let m = vs.rows;
+    let kmax = vs.cols;
+    var z: f64[NB] = [0.0; NB];
+    for j in k1 - k0 {
+        let kj = k0 + j;
+        let tj = row(tt, kj);
+        assert(tj.len == NB);
+        for &x in tj { x = 0.0; }
+        tj[j] = tau[kj];
+        if tau[kj] == 0.0 { continue; }
+        for l in j { z[l] = 0.0; }
+        for i in kj + off..m {
+            let vi = row(vs, i);
+            assert(vi.len == kmax);
+            let x = vi[kj];
+            axpy(x, vi[k0..k0 + j], z[..j]);
         }
-        for i in k + 1..m { r.data[i * n + k] = 0.0; }
+        for i in j {
+            let ti = row(tt, k0 + i);
+            assert(ti.len == NB);
+            var acc = 0.0;
+            for l in i..j { acc += ti[l] * z[l]; }
+            ti[j] = -tau[kj] * acc;
+        }
+    }
+}
+
+// q = H_0 H_1 ... H_kmax-1 q, for q starting out as the first q.cols
+// columns of the identity, with each block's T already in tt. Blocks go
+// last first, and each multiplies only rows and columns b0 + off on: the
+// rest of q is still the identity there, which the block leaves alone.
+fn form_from_reflectors(q: matrix&, vs: matrix&, tau: f64[:], off: i64, tt: matrix&) {
+    let m = q.rows;
+    let kmax = vs.cols;
+    var blocks = (kmax + NB - 1) / NB;
+    while blocks > 0 {
+        blocks--;
+        let b0 = blocks * NB;
+        let kb = min(b0 + NB, kmax) - b0;
+        let r0 = b0 + off;
+        let nc = q.cols - r0;
+        if nc <= 0 { continue; }
+        var wb = zeros(kb, nc);
+        gemm_acc(wb, 0, 0, vs, r0, b0, true, q, r0, r0, kb, nc, m - r0, 1.0);
+        apply_t(wb, tt, b0, kb, false);
+        gemm_acc(q, r0, r0, vs, r0, b0, false, wb, 0, 0, m - r0, nc, kb, -1.0);
+    }
+}
+
+// wb = T wb, or T^T wb with trans, in place, for the kb x kb upper
+// triangular T in rows k0..k0 + kb of tt. Rows are combined in the order
+// that reads each source row before it is overwritten.
+fn apply_t(wb: matrix&, tt: matrix&, k0: i64, kb: i64, trans: bool) {
+    fn t(i: i64, l: i64) -> f64 { tt.data[(k0 + i) * tt.cols + l] }
+    if trans {
+        // Row i of T^T wb is the sum over l <= i of T[l][i] wb[l]: bottom up.
+        for ii in kb {
+            let i = kb - 1 - ii;
+            let wi = row(wb, i);
+            let d = t(i, i);
+            for &x in wi { x *= d; }
+            for l in i { axpy(t(l, i), row(wb, l), wi); }
+        }
+    } else {
+        // Row i of T wb is the sum over l >= i of T[i][l] wb[l]: top down.
+        for i in kb {
+            let wi = row(wb, i);
+            let d = t(i, i);
+            for &x in wi { x *= d; }
+            for l in i + 1..kb { axpy(t(i, l), row(wb, l), wi); }
+        }
     }
 }
 
@@ -831,28 +1078,39 @@ fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
         }
         d[i] = h;
     }
-    // Accumulate the transformations.
-    for i in n - 1 {
-        let wi = row(w, i);
-        let wi1 = row(w, i + 1);
-        assert(wi.len == n && wi1.len == n);
-        wi[n - 1] = wi[i];
-        wi[i] = 1.0;
+    // Accumulate the transformations: q = H_n-2 ... H_0, where
+    // H_i = I - u_i u_i^T / h_i acts on coordinates 0..=i, u_i is row i + 1
+    // of w over columns 0..=i, and h_i = d[i + 1]. With the coordinates
+    // reversed, c to n - 1 - c, that is G_0 ... G_n-2 with G_k = H_n-2-k
+    // acting from coordinate k + 1 on: form_from_reflectors' shape, blocked.
+    // The tridiagonal's diagonal is w's own.
+    let nr = n - 1;
+    var vs = zeros(n, nr);
+    var tau: f64[>..] = [];
+    tau.resize(nr, 0.0);
+    for k in nr {
+        let i = n - 2 - k;
         let h = d[i + 1];
-        if h != 0.0 {
-            for k in i + 1 { d[k] = wi1[k] / h; }
-            for j in i + 1 {
-                let wj = row(w, j);
-                axpy(-dot(wi1[..i + 1], wj[..i + 1]), d[..i + 1], wj[..i + 1]);
-            }
-        }
-        for k in i + 1 { wi1[k] = 0.0; }
+        if h == 0.0 { continue; }
+        tau[k] = 1.0 / h;
+        let ui = row(w, i + 1);
+        for c in i + 1 { vs.data[(n - 1 - c) * nr + k] = ui[c]; }
     }
-    for j in n {
-        d[j] = w.data[j * n + n - 1];
-        w.data[j * n + n - 1] = 0.0;
+    for j in n { d[j] = w.data[j * n + j]; }
+    var tt = zeros(nr, NB);
+    var k0 = 0;
+    while k0 < nr {
+        householder_t(vs, tau, k0, min(k0 + NB, nr), 1, tt);
+        k0 += NB;
     }
-    w.data[(n - 1) * n + n - 1] = 1.0;
+    var qrev = identity(n);
+    form_from_reflectors(qrev, vs, tau, 1, tt);
+    // w = q^T, back in the original coordinates: w[a][b] = q[b][a].
+    for a in n {
+        let wa = row(w, a);
+        assert(wa.len == n);
+        for b in n { wa[b] = qrev.data[(n - 1 - b) * n + n - 1 - a]; }
+    }
     e[0] = 0.0;
 
     // tql2: diagonalize the tridiagonal matrix by implicit QL steps.
@@ -1035,43 +1293,52 @@ fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     if nrt + 1 < p { e[nrt] = at.data[(p - 1) * m + nrt]; }
     e[p - 1] = 0.0;
 
-    // Generate u from its reflections, last first.
-    for j in nct..n {
-        let uj = row(ut, j);
-        for &x in uj { x = 0.0; }
-        uj[j] = 1.0;
-    }
-    for kk in nct {
-        let k = nct - 1 - kk;
-        let uk = row(ut, k);
-        assert(uk.len == m);
-        if s[k] != 0.0 {
-            for j in k + 1..n {
-                let uj = row(ut, j);
-                axpy(-dot(uk[k..], uj[k..]) / uk[k], uk[k..], uj[k..]);
-            }
-            for i in k..m { uk[i] = -uk[i]; }
-            uk[k] += 1.0;
-            for i in k { uk[i] = 0.0; }
-        } else {
-            for &x in uk { x = 0.0; }
-            uk[k] = 1.0;
+    // Generate u and v from their reflectors, blocked as qr's q. Reflector
+    // k of u is H_k = I - u_k u_k^T / u_k[k], u_k row k of ut from column k
+    // on, where s[k] != 0; v's is G_k = I - v_k v_k^T / v_k[k + 1], v_k row k
+    // of vt from column k + 1 on, where k < nrt and e[k] != 0.
+    {
+        var vs = zeros(m, nct);
+        var tau: f64[>..] = [];
+        tau.resize(nct, 0.0);
+        for k in nct {
+            let uk = row(ut, k);
+            assert(uk.len == m);
+            if s[k] == 0.0 { continue; }
+            tau[k] = 1.0 / uk[k];
+            for i in k..m { vs.data[i * nct + k] = uk[i]; }
         }
-    }
-
-    // Generate v likewise.
-    for kk in n {
-        let k = n - 1 - kk;
-        let vk = row(vt, k);
-        assert(vk.len == n);
-        if k < nrt && e[k] != 0.0 {
-            for j in k + 1..n {
-                let vj = row(vt, j);
-                axpy(-dot(vk[k + 1..], vj[k + 1..]) / vk[k + 1], vk[k + 1..], vj[k + 1..]);
-            }
+        var tt = zeros(nct, NB);
+        var k0 = 0;
+        while k0 < nct {
+            householder_t(vs, tau, k0, min(k0 + NB, nct), 0, tt);
+            k0 += NB;
         }
-        for &x in vk { x = 0.0; }
-        vk[k] = 1.0;
+        var um = zeros(m, n);
+        for i in n { um.data[i * n + i] = 1.0; }
+        form_from_reflectors(um, vs, tau, 0, tt);
+        ut = transpose(um);
+    }
+    {
+        var vs = zeros(n, nrt);
+        var tau: f64[>..] = [];
+        tau.resize(nrt, 0.0);
+        for k in nrt {
+            let vk = row(vt, k);
+            assert(vk.len == n);
+            if e[k] == 0.0 { continue; }
+            tau[k] = 1.0 / vk[k + 1];
+            for i in k + 1..n { vs.data[i * nrt + k] = vk[i]; }
+        }
+        var tt = zeros(nrt, NB);
+        var k0 = 0;
+        while k0 < nrt {
+            householder_t(vs, tau, k0, min(k0 + NB, nrt), 1, tt);
+            k0 += NB;
+        }
+        var vm = identity(n);
+        form_from_reflectors(vm, vs, tau, 1, tt);
+        vt = transpose(vm);
     }
 
     // Diagonalize the bidiagonal. Rotations of columns j and q of u or v

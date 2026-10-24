@@ -57,17 +57,26 @@ instead: `"guillochon/goose-linalg@<commit>"`.
 
 ## Algorithms and accuracy
 
-- `lu_factor` uses partial pivoting. `det`, `solve` and `inverse` are built on it, and
-  `solve_matrix` / `inverse` work on whole rows of right-hand sides at once.
-- `qr` uses Householder reflections. `lstsq` solves through QR and refuses rank-deficient input
-  rather than returning garbage.
+- `lu_factor` uses partial pivoting, blocked as LAPACK's `getrf`. It factors a panel of 32
+  columns, solves for the matching block row of U, then updates the trailing matrix with one
+  matrix multiply. Up to 64 columns it runs unblocked. `det`, `solve`, `solve_matrix` and
+  `inverse` are built on it. The triangular solves behind `solve_matrix` and `inverse` are blocked
+  the same way. `inverse` also skips the zeros of L⁻¹, so it costs about 2n³ flops rather than
+  2⅔n³.
+- `cholesky` is blocked as `potrf`: a 32-column panel, then a matrix-multiply update of the
+  trailing lower triangle.
+- `qr` uses Householder reflections, blocked as `geqrf`/`orgqr` with the compact WY form. The 32
+  reflectors of a panel combine into I − V·T·Vᵀ, so the rest of R, and later Q, take each block
+  as two matrix multiplies. `lstsq` solves through QR and refuses rank-deficient input rather
+  than returning garbage.
 - `eigh` reduces the matrix to tridiagonal form with Householder reflections, then diagonalizes it
   with implicit QL steps and Wilkinson shifts. These are EISPACK's `tred2` and `tql2`, ported from
   their public-domain JAMA form and run on the transposed matrix so their inner loops follow rows.
+  The eigenvector basis is built from the reflectors in compact WY blocks, like `qr`'s Q.
 - `svd` uses Golub-Kahan-Reinsch. Householder reflections reduce the matrix to bidiagonal form,
   then implicit-shift QR steps diagonalize it. This is LINPACK's `dsvdc` by way of JAMA, and
   LAPACK's SVD routines build on the same reduction. Like `eigh`, it works on transposed
-  storage. Every singular value is accurate to about ε·σ_max, so a value far below σ_max is
+  storage, and builds U and V from their reflectors in compact WY blocks. Every singular value is accurate to about ε·σ_max, so a value far below σ_max is
   only accurate in absolute terms (a one-sided Jacobi SVD would also get those right relative
   to their own size).
 - `svd` always returns orthonormal `u` and `v`, rank-deficient matrices included.
@@ -105,18 +114,25 @@ absolute times at n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
-| Goose | 2.6 ms | 3.0 ms | 7.9 ms | 2.0 ms | 18 ms | 26 ms | 54 ms |
-| OpenBLAS | 2.1 ms | 1.3 ms | 4.4 ms | 1.1 ms | 6.2 ms | 11 ms | 22 ms |
-| ratio | 1.2× | 2.3× | 1.8× | 1.8× | 2.9× | 2.3× | 2.4× |
+| Goose | 2.6 ms | 1.7 ms | 4.1 ms | 1.0 ms | 6.5 ms | 21 ms | 42 ms |
+| OpenBLAS | 2.0 ms | 1.2 ms | 4.4 ms | 1.2 ms | 6.1 ms | 11 ms | 21 ms |
+| ratio | 1.3× | 1.4× | **0.94×** | **0.90×** | 1.06× | 1.9× | 2.0× |
 
-`matmul` runs at 49 GFLOP/s against OpenBLAS's 61. At n = 50, `matvec`, `solve`, `det`,
-`cholesky`, `eigh` and `svd` are as fast as NumPy or faster.
+`matmul` runs at 50 GFLOP/s against OpenBLAS's 62. At n = 50, `matvec`, `solve`, `det`,
+`inverse`, `cholesky` and `eigh` are as fast as NumPy or faster.
 
 What makes the kernels fast:
 - Inner loops run over row slices with `assert`ed lengths, so Goose drops their bounds checks.
 - Update loops (`ri[j] -= f * rk[j]`) then vectorize as written.
 - Sums use `dot`'s lane array, the one form MSVC vectorizes without fast-math.
-- `matmul` is register-blocked, four rows of the result by four steps of the inner dimension.
+- One matrix-multiply kernel, `gemm_acc`, works on blocks of matrices. It's register-blocked four
+  rows of the result by four steps of the inner dimension. `matmul` is a single call to it, and
+  the blocked LU, Cholesky, QR and the eigenvector/singular-vector bases do most of their work in
+  it.
+
+`eigh` and `svd` remain about 2× behind. Their reductions to tridiagonal/bidiagonal form are
+still one reflector at a time, and their QR iterations spend most of their time on plane
+rotations. LAPACK replaces both with blocked reductions and divide-and-conquer solvers.
 
 Everything is single-threaded. On this hybrid CPU, multi-threaded OpenBLAS was more than 100× *slower* for
 LU at n = 400 than single-threaded OpenBLAS.
@@ -139,22 +155,24 @@ reference) and runs each, plus OpenBLAS, pinned to one core.
 goose test/test_linalg.goose
 ```
 
-The suite runs 1,117 checks and exits 1 on any failure. It has two kinds of checks:
+The suite runs 1,201 checks and exits 1 on any failure. It has two kinds of checks:
 - **Exact cases worked by hand:** the Hilbert inverse, a textbook Cholesky factor, Fibonacci
   through `power`, the path-graph Laplacian spectrum, and Wilkinson's W₂₁⁺, whose eigenvalues come in
   pairs that agree to about 10⁻¹⁴.
 - **SVD edge cases:** matrices that force the bidiagonal QR to split and to deflate, graded
   singular values from 1 down to 10⁻¹⁵, and clustered singular values that only converge with
   the Wilkinson shift.
+- **Blocked sizes:** n = 33, 64 and 97, past the 32-column panels, for every blocked routine,
+  with singular and indefinite matrices whose trouble lies past the first block.
 - **Identities on random matrices:** checked at sizes 1–29, square, tall and wide. These cover
   `p a = l u`, `q r = a` with `q` orthogonal, `a v = v diag(w)`, `u s vᵀ = a`, the four
   Moore-Penrose conditions, `det(ab) = det(a) det(b)`, and more.
 
 The suite passes in-process, as a native MSVC build, and with production flags. It was also
-mutation-tested: 48 bugs were planted in the library one at a time. Every one that changes the
-library's behavior was caught; the one survivor swaps the Wilkinson shift for a simpler shift that
-also converges. The mutants covered the blocked `matmul`, the `dot` lanes, `tred2`/`tql2`, every
-branch of the Golub-Kahan iteration, and the multi-RHS solve.
+mutation-tested: 67 bugs were planted in the library one at a time, and every one was caught.
+They covered `gemm_acc`, the blocked LU, Cholesky and QR panels, the compact-WY helpers, the
+reflector-based U, V and eigenvector bases, every branch of the Golub-Kahan iteration,
+`tred2`/`tql2`, and the `dot` lanes.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.
 
