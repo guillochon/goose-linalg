@@ -15,3 +15,7 @@ examples/fit
 .idea/
 .DS_Store
 Thumbs.db
+
+# Benchmark outputs
+bench/*.csv
+bench/*.png

@@ -63,6 +63,41 @@ fn main() {
 - `svd` always returns orthonormal `u` and `v`, completing the basis when the matrix is rank
   deficient.
 
+## Performance
+
+The `bench/` folder times every operation against NumPy on OpenBLAS 0.3.29. The table is for
+n = 400, single-threaded, pinned to one performance core of an i5-12600K. Goose was built with
+MSVC `/O2`.
+
+| | matmul | solve | inverse | cholesky | qr | eigh | svd |
+|---|---|---|---|---|---|---|---|
+| Goose | 9.1 ms | 3.6 ms | 32 ms | 3.2 ms | 26 ms | 900 ms | 540 ms |
+| OpenBLAS | 2.1 ms | 1.3 ms | 4.5 ms | 1.2 ms | 6.7 ms | 12 ms | 26 ms |
+| ratio | 4.3× | 2.8× | 7.0× | 2.8× | 3.9× | 76× | 21× |
+
+At n ≤ 50, `solve`, `det` and `cholesky` beat NumPy, which pays about 1–5 µs of call overhead per
+operation.
+
+Inner loops run over row slices whose lengths are `assert`ed. That lets Goose drop the bounds
+checks, and lets the C compiler vectorize update loops like `ri[j] -= f * rk[j]`. Dot-product
+loops (`s += x[k] * y[k]`) stay scalar, because MSVC won't reorder a floating-point sum without
+`/fp:fast`.
+
+The Jacobi eigensolvers rotate contiguous rows: `svd` works on transposed factors, and `eigh`
+keeps its eigenvectors as rows. Their remaining gap to LAPACK is algorithmic: every sweep costs
+O(n³), and LAPACK reduces to tridiagonal form once instead.
+
+To reproduce:
+```bash
+goose build bench/bench.goose && cd bench && ./bench
+```
+```bash
+OPENBLAS_NUM_THREADS=1 python bench_lapack.py lapack_1t
+```
+```bash
+python bench_lapack.py lapack_mt && python compare.py
+```
+
 ## Tests
 
 ```bash
@@ -76,7 +111,7 @@ The suite runs 988 checks and exits 1 on any failure. It has two kinds of checks
   `p a = l u`, `q r = a` with `q` orthogonal, `a v = v diag(w)`, `u s vᵀ = a`, the four
   Moore-Penrose conditions, `det(ab) = det(a) det(b)`, and more.
 
-The suite passes both in-process and in a native MSVC build. It was also mutation-tested: 16 bugs
+The suite passes both in-process and in a native MSVC build. It was also mutation-tested: 23 bugs
 were planted in the library one at a time, and every one was caught.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.

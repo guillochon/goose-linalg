@@ -367,10 +367,13 @@ fn solve_lower(l, b: f64[:], unit_diag: bool = false) -> f64[>..] {
     assert(l.rows == l.cols && l.rows == b.len);
     let n = b.len;
     var x: f64[>..] = [];
+    x.resize(n, 0.0);
     for i in n {
+        let li = row(l, i);
+        assert(li.len == n && x.len == n);
         var s = b[i];
-        for k in i { s -= l.data[i * n + k] * x[k]; }
-        x.push(if unit_diag { s } else { s / l.data[i * n + i] });
+        for k in i { s -= li[k] * x[k]; }
+        x[i] = if unit_diag { s } else { s / li[i] };
     }
     return x;
 }
@@ -383,9 +386,11 @@ fn solve_upper(u, b: f64[:]) -> f64[>..] {
     x.resize(n, 0.0);
     for ii in n {
         let i = n - 1 - ii;
+        let ui = row(u, i);
+        assert(ui.len == n && x.len == n);
         var s = b[i];
-        for k in i + 1..n { s -= u.data[i * n + k] * x[k]; }
-        x[i] = s / u.data[i * n + i];
+        for k in i + 1..n { s -= ui[k] * x[k]; }
+        x[i] = s / ui[i];
     }
     return x;
 }
@@ -412,22 +417,30 @@ fn lu_factor(a: matrix&, piv: i64[>..]&) -> f64, bool {
             if v > big { big = v; p = i; }
         }
         if big == 0.0 { ok = false; continue; }
+        // Row slices with their lengths asserted: the inner loops then run
+        // without bounds checks, and the C compiler can vectorize them.
+        let rk = a.data[k * n..(k + 1) * n];
+        assert(rk.len == n);
         if p != k {
+            let rp = a.data[p * n..(p + 1) * n];
+            assert(rp.len == n);
             for j in n {
-                let t = a.data[k * n + j];
-                a.data[k * n + j] = a.data[p * n + j];
-                a.data[p * n + j] = t;
+                let t = rk[j];
+                rk[j] = rp[j];
+                rp[j] = t;
             }
             let t = piv[k];
             piv[k] = piv[p];
             piv[p] = t;
             sign = -sign;
         }
-        let pivot = a.data[k * n + k];
+        let pivot = rk[k];
         for i in k + 1..n {
-            let f = a.data[i * n + k] / pivot;
-            a.data[i * n + k] = f;
-            for j in k + 1..n { a.data[i * n + j] -= f * a.data[k * n + j]; }
+            let ri = a.data[i * n..(i + 1) * n];
+            assert(ri.len == n);
+            let f = ri[k] / pivot;
+            ri[k] = f;
+            for j in k + 1..n { ri[j] -= f * rk[j]; }
         }
     }
     return sign, ok;
@@ -491,33 +504,41 @@ fn cholesky(a) -> matrix, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     var l = zeros(n, n);
+    var ok = true;
     for j in n {
+        // Entry (i, j) is a dot product of rows i and j of l, up to column j.
+        let lj = l.data[j * n..(j + 1) * n];
+        assert(lj.len == n);
         var d = a.data[j * n + j];
-        for k in j { d -= l.data[j * n + k] * l.data[j * n + k]; }
-        guard d > 0.0 else { return l, false; }
+        for k in j { d -= lj[k] * lj[k]; }
+        if d <= 0.0 || d != d { ok = false; break; }
         let ljj = sqrt(d);
-        l.data[j * n + j] = ljj;
+        lj[j] = ljj;
         for i in j + 1..n {
+            let li = l.data[i * n..(i + 1) * n];
+            assert(li.len == n);
             var s = a.data[i * n + j];
-            for k in j { s -= l.data[i * n + k] * l.data[j * n + k]; }
-            l.data[i * n + j] = s / ljj;
+            for k in j { s -= li[k] * lj[k]; }
+            li[j] = s / ljj;
         }
     }
-    return l, true;
+    return l, ok;
 }
 
 // Solves a x = b given a's Cholesky factor l.
 fn cholesky_solve(l, b: f64[:]) -> f64[>..] {
     assert(l.rows == l.cols && l.rows == b.len);
     let n = b.len;
-    let y = solve_lower(l, b);
-    var x: f64[>..] = [];
-    x.resize(n, 0.0);
+    // l y = b, then l^T x = y column by column: column i of l^T is row i of l,
+    // so once x[i] is known it is subtracted from the y above it along that row.
+    var x = solve_lower(l, b);
     for ii in n {
         let i = n - 1 - ii;
-        var s = y[i];
-        for k in i + 1..n { s -= l.data[k * n + i] * x[k]; }
-        x[i] = s / l.data[i * n + i];
+        let li = row(l, i);
+        assert(li.len == n && x.len == n);
+        let xi = x[i] / li[i];
+        x[i] = xi;
+        for k in i { x[k] -= li[k] * xi; }
     }
     return x;
 }
@@ -533,6 +554,8 @@ fn qr(a, q: matrix&, r: matrix&) {
     r = clone(a);
     q = identity(m);
     var v: f64[>..] = [];
+    var w: f64[>..] = [];
+    w.resize(n, 0.0);
     for k in min(m - 1, n) {
         // The reflection that takes r[k.., k] to a multiple of e_k.
         v.clear();
@@ -542,19 +565,29 @@ fn qr(a, q: matrix&, r: matrix&) {
         let vn = vnorm(v);
         if vn == 0.0 { continue; }
         for &x in v { x /= vn; }
-        // r[k.., ..] -= 2 v (v^T r[k.., ..])
-        for j in k..n {
-            var s = 0.0;
-            for i in k..m { s += v[i - k] * r.data[i * n + j]; }
-            s *= 2.0;
-            for i in k..m { r.data[i * n + j] -= s * v[i - k]; }
+        // r[k.., ..] -= 2 v w^T with w^T = v^T r[k.., ..], both passes along rows.
+        assert(w.len == n);
+        for j in k..n { w[j] = 0.0; }
+        for i in k..m {
+            let ri = row(r, i);
+            assert(ri.len == n);
+            let vi = v[i - k];
+            for j in k..n { w[j] += vi * ri[j]; }
+        }
+        for i in k..m {
+            let ri = row(r, i);
+            assert(ri.len == n);
+            let vi = 2.0 * v[i - k];
+            for j in k..n { ri[j] -= vi * w[j]; }
         }
         // q[.., k..] -= 2 (q[.., k..] v) v^T, accumulating q = H_1 H_2 ...
         for i in m {
+            let qi = q.data[i * m + k..(i + 1) * m];
+            assert(qi.len == v.len);
             var s = 0.0;
-            for t in k..m { s += q.data[i * m + t] * v[t - k]; }
+            for t in qi.len { s += qi[t] * v[t]; }
             s *= 2.0;
-            for t in k..m { q.data[i * m + t] -= s * v[t - k]; }
+            for t in qi.len { qi[t] -= s * v[t]; }
         }
         for i in k + 1..m { r.data[i * n + k] = 0.0; }
     }
@@ -587,12 +620,29 @@ fn lstsq(a, b: f64[:]) -> f64[>..], bool {
 // ---------------------------------------------------------------------------
 // Symmetric eigenproblem
 
-// Swaps columns p and q of m.
-fn swap_cols(m: matrix&, p: i64, q: i64) {
-    for i in m.rows {
-        let t = m.data[i * m.cols + p];
-        m.data[i * m.cols + p] = m.data[i * m.cols + q];
-        m.data[i * m.cols + q] = t;
+// Swaps rows p and q of m.
+fn swap_rows(m: matrix&, p: i64, q: i64) {
+    let rp = row(m, p);
+    let rq = row(m, q);
+    assert(rq.len == rp.len);
+    for k in rp.len {
+        let t = rp[k];
+        rp[k] = rq[k];
+        rq[k] = t;
+    }
+}
+
+// Rows p and q of m become c p - s q and s p + c q: the rotation every
+// Jacobi step applies, along two contiguous rows.
+fn rotate_rows(m: matrix&, p: i64, q: i64, c: f64, s: f64) {
+    let rp = row(m, p);
+    let rq = row(m, q);
+    assert(rq.len == rp.len);
+    for k in rp.len {
+        let x = rp[k];
+        let y = rq[k];
+        rp[k] = c * x - s * y;
+        rq[k] = s * x + c * y;
     }
 }
 
@@ -604,12 +654,19 @@ fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     var w = clone(a);
-    vectors = identity(n);
+    // The eigenvectors are kept as rows, so their rotations run along rows
+    // too, and transposed once at the end.
+    var vt = identity(n);
     let size = max(norm_fro(a), 1.0e-300);
     var converged = false;
     for sweep in 100 {
         var off = 0.0;
-        for i in n { for j in n { if i != j { off += w.data[i * n + j] * w.data[i * n + j]; } } }
+        for i in n {
+            // Summed directly: all minus diagonal would cancel catastrophically
+            // just when the diagonal dominates, and stop the sweeps too early.
+            let wi = row(w, i);
+            for x, j in wi { if j != i { off += x * x; } }
+        }
         // Off-diagonal mass at rounding level is as converged as it gets.
         if sqrt(off) <= EPS * size { converged = true; break; }
         for p in n {
@@ -620,29 +677,35 @@ fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
                     w.data[q * n + p] = 0.0;
                     continue;
                 }
-                let theta = (w.data[q * n + q] - w.data[p * n + p]) / (2.0 * apq);
+                let app = w.data[p * n + p];
+                let aqq = w.data[q * n + q];
+                let theta = (aqq - app) / (2.0 * apq);
                 var t = 1.0 / (abs(theta) + sqrt(theta * theta + 1.0));
                 if theta < 0.0 { t = -t; }
                 let c = 1.0 / sqrt(t * t + 1.0);
                 let s = t * c;
-                for k in n {     // w = w J
-                    let wkp = w.data[k * n + p];
-                    let wkq = w.data[k * n + q];
-                    w.data[k * n + p] = c * wkp - s * wkq;
-                    w.data[k * n + q] = s * wkp + c * wkq;
+                // w = J^T w J. Outside the (p, q) block, rows p and q of the
+                // result are rows p and q of J^T w, rotated along the rows;
+                // columns p and q follow by symmetry.
+                let wp = row(w, p);
+                let wq = row(w, q);
+                assert(wp.len == n && wq.len == n);
+                for k in n {
+                    let x = wp[k];
+                    let y = wq[k];
+                    wp[k] = c * x - s * y;
+                    wq[k] = s * x + c * y;
                 }
-                for k in n {     // w = J^T w
-                    let wpk = w.data[p * n + k];
-                    let wqk = w.data[q * n + k];
-                    w.data[p * n + k] = c * wpk - s * wqk;
-                    w.data[q * n + k] = s * wpk + c * wqk;
+                for k in n {
+                    w.data[k * n + p] = wp[k];
+                    w.data[k * n + q] = wq[k];
                 }
-                for k in n {     // vectors = vectors J
-                    let vkp = vectors.data[k * n + p];
-                    let vkq = vectors.data[k * n + q];
-                    vectors.data[k * n + p] = c * vkp - s * vkq;
-                    vectors.data[k * n + q] = s * vkp + c * vkq;
-                }
+                // The block itself, where t was chosen to zero apq.
+                wp[p] = app - t * apq;
+                wq[q] = aqq + t * apq;
+                wp[q] = 0.0;
+                wq[p] = 0.0;
+                rotate_rows(vt, p, q, c, s);
             }
         }
     }
@@ -656,9 +719,10 @@ fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
             let t = values[i];
             values[i] = values[best];
             values[best] = t;
-            swap_cols(vectors, i, best);
+            swap_rows(vt, i, best);
         }
     }
+    vectors = transpose(vt);
     return converged;
 }
 
@@ -672,28 +736,26 @@ fn eigvals_sym(a) -> f64[>..] {
 // ---------------------------------------------------------------------------
 // Singular value decomposition
 
-// Makes the columns of u from `from` on orthonormal to all the columns
-// before them, by Gram-Schmidt on unit vectors.
-fn complete_basis(u: matrix&, from: i64) {
-    let m = u.rows;
+// Makes the rows of m from `from` on orthonormal to all the rows before
+// them, by Gram-Schmidt on unit vectors.
+fn complete_rows(m: matrix&, from: i64) {
+    let len = m.cols;
     var e = 0;
-    for j in from..u.cols {
+    for j in from..m.rows {
+        let rj = row(m, j);
         loop {
-            assert(e < m);
-            for i in m { u.data[i * u.cols + j] = if i == e { 1.0 } else { 0.0 }; }
+            assert(e < len);
+            for x, i in rj { rj[i] = if i == e { 1.0 } else { 0.0 }; }
             e++;
             for pass in 2 {
                 for k in j {
-                    var s = 0.0;
-                    for i in m { s += u.data[i * u.cols + k] * u.data[i * u.cols + j]; }
-                    for i in m { u.data[i * u.cols + j] -= s * u.data[i * u.cols + k]; }
+                    let rk = row(m, k);
+                    axpy(-dot(rk, rj), rk, rj);
                 }
             }
-            var nrm = 0.0;
-            for i in m { nrm += u.data[i * u.cols + j] * u.data[i * u.cols + j]; }
-            nrm = sqrt(nrm);
+            let nrm = vnorm(rj);
             if nrm > 0.5 {
-                for i in m { u.data[i * u.cols + j] /= nrm; }
+                for &x in rj { x /= nrm; }
                 break;
             }
         }
@@ -710,27 +772,30 @@ fn svd(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     return svd_tall(transpose(a), v, s, u);     // a^T = v diag(s) u^T
 }
 
-// svd for rows >= cols.
+// svd for rows >= cols. One-sided Jacobi rotates pairs of columns of a until
+// they are orthogonal; it works on a^T here, so each column is a contiguous
+// row, and so does v.
 fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     assert(a.rows >= a.cols);
     let m = a.rows;
     let n = a.cols;
-    u = clone(a);
-    v = identity(n);
+    var ut = transpose(a);
+    var vt = identity(n);
     var converged = false;
     for sweep in 100 {
         var rotated = false;
         for p in n {
             for q in p + 1..n {
+                let up = row(ut, p);
+                let uq = row(ut, q);
+                assert(up.len == m && uq.len == m);
                 var alpha = 0.0;
                 var beta = 0.0;
                 var gamma = 0.0;
                 for i in m {
-                    let up = u.data[i * n + p];
-                    let uq = u.data[i * n + q];
-                    alpha += up * up;
-                    beta += uq * uq;
-                    gamma += up * uq;
+                    alpha += up[i] * up[i];
+                    beta += uq[i] * uq[i];
+                    gamma += up[i] * uq[i];
                 }
                 if abs(gamma) <= EPS * sqrt(alpha * beta) { continue; }
                 rotated = true;
@@ -739,29 +804,15 @@ fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
                 if zeta < 0.0 { t = -t; }
                 let c = 1.0 / sqrt(1.0 + t * t);
                 let sn = c * t;
-                for i in m {
-                    let up = u.data[i * n + p];
-                    let uq = u.data[i * n + q];
-                    u.data[i * n + p] = c * up - sn * uq;
-                    u.data[i * n + q] = sn * up + c * uq;
-                }
-                for i in n {
-                    let vp = v.data[i * n + p];
-                    let vq = v.data[i * n + q];
-                    v.data[i * n + p] = c * vp - sn * vq;
-                    v.data[i * n + q] = sn * vp + c * vq;
-                }
+                rotate_rows(ut, p, q, c, sn);
+                rotate_rows(vt, p, q, c, sn);
             }
         }
         if !rotated { converged = true; break; }
     }
-    // The singular values are the column norms; normalize, then sort.
+    // The singular values are the row norms; sort, then normalize.
     s.clear();
-    for j in n {
-        var nrm = 0.0;
-        for i in m { nrm += u.data[i * n + j] * u.data[i * n + j]; }
-        s.push(sqrt(nrm));
-    }
+    for j in n { s.push(vnorm(row(ut, j))); }
     for i in n {
         var best = i;
         for j in i + 1..n { if s[j] > s[best] { best = j; } }
@@ -769,20 +820,22 @@ fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
             let t = s[i];
             s[i] = s[best];
             s[best] = t;
-            swap_cols(u, i, best);
-            swap_cols(v, i, best);
+            swap_rows(ut, i, best);
+            swap_rows(vt, i, best);
         }
     }
     let tiny = if n > 0 { s[0] * EPS * m } else { 0.0 };
     var nonzero = 0;
     for j in n {
         if s[j] > tiny && s[j] > 0.0 {
-            for i in m { u.data[i * n + j] /= s[j]; }
+            for &x in row(ut, j) { x /= s[j]; }
             nonzero = j + 1;
         }
     }
-    // Columns for zero singular values: any orthonormal completion.
-    complete_basis(u, nonzero);
+    // Rows for zero singular values: any orthonormal completion.
+    complete_rows(ut, nonzero);
+    u = transpose(ut);
+    v = transpose(vt);
     return converged;
 }
 
@@ -828,14 +881,16 @@ fn pinv(a, tol: f64 = -1.0) -> matrix {
     var p = zeros(a.cols, a.rows);
     guard s.len > 0 else { return p; }
     let t = if tol >= 0.0 { tol } else { max(a.rows, a.cols) * EPS * s[0] };
-    let k = s.len;
-    for j in k {
+    // p = sum over j of v_j u_j^T / s_j: with u and v transposed, every
+    // update is a scaled row of u^T added to a row of p.
+    let ut = transpose(u);
+    let vt = transpose(v);
+    for j in s.len {
         if s[j] <= t { continue; }
         let inv = 1.0 / s[j];
-        for r in a.cols {
-            let vr = v.data[r * k + j] * inv;
-            for c in a.rows { p.data[r * a.rows + c] += vr * u.data[c * k + j]; }
-        }
+        let uj = row(ut, j);
+        let vj = row(vt, j);
+        for r in a.cols { axpy(vj[r] * inv, uj, row(p, r)); }
     }
     return p;
 }
