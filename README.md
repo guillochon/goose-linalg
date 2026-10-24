@@ -5,7 +5,7 @@ build step, nothing to install. An optional module, `linalg.parallel`, runs the 
 several threads.
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.2.0";   // or from "../goose-linalg" for a local checkout
+import linalg from "guillochon/goose-linalg@v0.2.1";   // or from "../goose-linalg" for a local checkout
 
 fn main() {
     let a = linalg::from_rows(3, 3, [4, 1, 2, 1, 3, 0, 2, 0, 5]);
@@ -61,8 +61,9 @@ first, until `goose fetch --update`.
 
 - `lu_factor` uses partial pivoting, blocked twice as LAPACK's `getrf`. Within an outer block of
   256 columns it factors 32-column panels, each updating the rest of the outer block with one
-  matrix multiply; then the outer block updates the whole trailing matrix, 256 deep. Up to 64
-  columns it runs unblocked. `det`, `solve`, `solve_matrix` and `inverse` are built on it. The
+  matrix multiply; then the outer block updates the whole trailing matrix, 256 deep. Each panel is
+  factored in a column-major copy, so its divisions and updates run down long contiguous columns.
+  Up to 64 columns it runs unblocked. `det`, `solve`, `solve_matrix` and `inverse` are built on it. The
   triangular solves behind `solve_matrix` and `inverse` are blocked the same two ways. `inverse`
   also skips the zeros of L⁻¹, so it costs about 2n³ flops rather than 2⅔n³.
 - `cholesky` is blocked the same way, as `potrf`: 32-column panels within 256-column outer
@@ -107,7 +108,7 @@ summation order.
 ## Multithreading
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.2.0";
+import linalg from "guillochon/goose-linalg@v0.2.1";
 import linalg.parallel;
 
 fn main() {
@@ -125,25 +126,50 @@ are unaffected.
 
 Each `_mt` function is its serial namesake with one change: the kernel of its large matrix
 products, `gemm_mt`, shares a product's rows (or columns) out between a pool of worker threads and
-the calling thread. The results are **bit for bit the serial ones** under IEEE floating point (not
+the calling thread. Large LU factorizations go further and keep the matrix on the workers (see
+below). Either way the results are **bit for bit the serial ones** under IEEE floating point (not
 under `/fp:fast`).
 
 Goose threads share no memory: a worker is a separate program, and its operands and results are
 copied through typed queues. On the test machine a number costs about 1.6 ns to cross a queue
 (each message is a fresh allocation), so sharing a product pays only when it does enough work per
 number copied. `gemm_mt` estimates both sides, and keeps any product that wouldn't pay on the
-calling thread. In practice:
+calling thread.
+
+That limits what an LU factorization can gain from `gemm_mt`. Each 256-deep outer update would
+send the whole trailing matrix out and bring it back, so the copies grow as n³ like the work
+does, and adding threads never pays for them. So from n = 1100, on 3 threads or more, the LU
+family factors **owner-computes** instead, as distributed-memory LAPACK (ScaLAPACK) does:
+- The columns past the first outer block are dealt to the workers in 32-column blocks, and stay
+  there.
+- Each step, the calling thread factors the 256-column panel and sends it, with its row swaps, down
+  a tree of workers. Each worker passes the panel on to two more before it starts its own columns.
+- Each worker updates the next panel's columns first and sends them straight back, so the calling
+  thread can factor them while the workers update the rest.
+
+The trailing matrix never makes a round trip, so the copies grow only as n². Goose has one queue
+per message type, read by every worker. A message for one worker therefore needs a type of its
+own, and the owner-computes LU uses at most 8 workers.
+
+In practice:
 
 - `matmul_mt` pays from about n = 500.
-- The LU family (`lu_factor_mt`, `det_mt`, `solve_mt`, `solve_matrix_mt`, `inverse_mt`) and
-  `cholesky_mt` share only their 256-deep outer updates, from about n = 1000. Up to n = 256 they
-  are the serial code.
+- The LU family (`lu_factor_mt`, `det_mt`, `solve_mt`, `solve_matrix_mt`, `inverse_mt`) factors
+  owner-computes from n = 1100 on 3 threads or more. Below that, or on 2 threads, it shares its
+  256-deep outer updates through `gemm_mt`, which pays from about n = 1000. `solve_matrix_mt` and
+  `inverse_mt` also share their triangular solves' products through `gemm_mt`.
+- `cholesky_mt` shares its outer updates through `gemm_mt`, from about n = 1000.
+- Up to n = 256 the factorizations are the serial code.
 - `qr`, `lstsq`, `eigh` and `svd` have no `_mt` versions. Their products are blocks of 32
   reflectors, too narrow ever to pay for the copies.
 
-So an `_mt` function is never slower than its serial version (measured from n = 100 to 1600 on 2
-and 6 threads, the worst ratio was 0.98×, within noise), and faster where there is enough work to
-share.
+The threshold comes from 2, 3, 4 and 6 threads on the test machine. Owner-computes overtook
+`gemm_mt`'s LU from n = 1000 on 3 and 4 threads, and from n = 1100 on 6. On 2 threads it ran about
+20% behind `gemm_mt` up to n = 1400, because one worker can't hide the serial panels. An `_mt`
+function ran at most 3% slower than its serial version, within noise, in these runs: every `_mt`
+function at n = 400, 800 and 1600 on 6 threads, and the LU factorization from n = 600 to 1400
+on 2, 3, 4 and 6 threads. The worst case was `cholesky_mt` at 0.97×. Where there is enough work
+to share, the `_mt` functions are faster.
 
 On a CPU with performance and efficiency cores, set the thread count to the number of performance
 cores. Call the `_mt` functions from main's thread: they share one pool and its queues, which live
@@ -205,17 +231,20 @@ Times at n = 1600, and the speedups on 6 threads over 1:
 
 | n = 1600 | matmul | det | solve | solve_matrix | inverse | cholesky |
 |---|---|---|---|---|---|---|
-| Goose, 1 thread | 184 ms | 88 ms | 82 ms | 287 ms | 258 ms | 51 ms |
-| Goose, 6 threads | 68 ms | 67 ms | 64 ms | 219 ms | 195 ms | 49 ms |
-| speedup | **2.7×** | 1.3× | 1.3× | 1.3× | 1.3× | 1.0× |
-| OpenBLAS, 1 thread | 121 ms | 53 ms | 54 ms | 199 ms | 194 ms | 40 ms |
-| OpenBLAS, 6 threads | 24 ms | 18 ms | 54 ms | 62 ms | 57 ms | 26 ms |
-| speedup | 5.0× | 2.9× | 1.0× | 3.2× | 3.4× | 1.6× |
+| Goose, 1 thread | 186 ms | 74 ms | 75 ms | 281 ms | 238 ms | 51 ms |
+| Goose, 6 threads | 69 ms | 50 ms | 50 ms | 187 ms | 174 ms | 49 ms |
+| speedup | **2.7×** | 1.5× | 1.5× | 1.5× | 1.4× | 1.0× |
+| OpenBLAS, 1 thread | 127 ms | 53 ms | 54 ms | 205 ms | 199 ms | 40 ms |
+| OpenBLAS, 6 threads | 24 ms | 19 ms | 55 ms | 71 ms | 58 ms | 26 ms |
+| speedup | 5.2× | 2.8× | 1.0× | 2.9× | 3.4× | 1.5× |
 
-On one thread Goose is 1.3–1.7× behind OpenBLAS at this size. On six it is 1.2–3.7× behind,
-because OpenBLAS's threads share the matrix in memory while Goose's copy their share of it. At
-n ≤ 800 only `matmul` gains (1.8× at n = 800); everything else runs serially there, at serial
-speed.
+On one thread Goose is 1.2–1.5× behind OpenBLAS at this size. On six it is 1.9–3.0× behind,
+because OpenBLAS's threads share the matrix in memory while Goose's copy what they work on. The
+exception is `solve`, where Goose is about 10% ahead: OpenBLAS doesn't speed it up on more threads
+at this size. The LU family's owner-computes factorization took `det` and `solve` from 1.3× to
+1.5× here. `solve_matrix` and `inverse` gain less, because most of their time is in the
+triangular solves, which still share products through `gemm_mt`. At n = 800 `matmul` gains 1.9×,
+`solve_matrix` and `inverse` 1.06×, and the rest run at serial speed.
 
 ### Reproducing
 
@@ -262,16 +291,19 @@ The parallel module has its own suite, which needs a native build:
 goose build test/test_parallel.goose && test/test_parallel
 ```
 
-Its 237 checks require every `_mt` result to equal the serial one bit for bit, at 1, 2, 3, 5 and 6
-threads, through both ways of sharing a product (by rows and by columns), across a pool restart
-and a resize. They also check that large products go to the pool and small ones don't.
+Its 444 checks require every `_mt` result to equal the serial one bit for bit, at 1 to 6 threads,
+through both ways of sharing a product (by rows and by columns), across a pool restart and a
+resize. They also check that large products go to the pool and small ones don't. The LU family is
+checked a second time with owner-computes switched on from n = 257, on 3, 6 and 10 threads (10 is
+more than its 8 worker slots).
 
 Both suites pass as native MSVC builds, plain and with production flags, and the serial one also
 in-process. They were also mutation-tested: 99 bugs were planted one at a time, 78 in the library
 and 21 in the parallel module, and every one was caught. They covered `gemm_acc` and its cache
 blocks, the two-level LU, solves and Cholesky, the compact-WY helpers, every branch of the
 Golub-Kahan iteration, `tred2`/`tql2`, the `dot` lanes, and, in the parallel module, the row and
-column shares, copying results back, the cost model and the pool.
+column shares, copying results back, the cost model and the pool. The owner-computes LU and the
+column-major LU panel came later and haven't been mutation-tested yet.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.
 

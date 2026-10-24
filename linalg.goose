@@ -554,79 +554,151 @@ fn lu_factor_with<G>(a: matrix&, piv: i64[>..]&) -> f64, bool {
     // Below a few panels' width, blocking costs more than it saves: one
     // panel covering the matrix is the unblocked algorithm.
     let nb = if n <= 2 * NB { max(n, 1) } else { NB };
+    var swaps: i64[>..] = [];
     var o0 = 0;
     while o0 < n {
         let o1 = min(o0 + OB, n);
-        var k0 = o0;
-        while k0 < o1 {
-            let k1 = min(k0 + nb, o1);
-            // The panel, columns k0..k1, updated only inside itself.
-            for k in k0..k1 {
-                var p = k;
-                var big = abs(a.data[k * n + k]);
-                for i in k + 1..n {
-                    let v = abs(a.data[i * n + k]);
-                    if v > big { big = v; p = i; }
-                }
-                if big == 0.0 { ok = false; continue; }
-                // Row slices with their lengths asserted: the inner loops then
-                // run without bounds checks, and the C compiler vectorizes them.
-                let rk = a.data[k * n..(k + 1) * n];
-                assert(rk.len == n);
-                if p != k {
-                    // Whole rows: the L to the left and the columns to the right.
-                    let rp = a.data[p * n..(p + 1) * n];
-                    assert(rp.len == n);
-                    for j in n {
-                        let t = rk[j];
-                        rk[j] = rp[j];
-                        rp[j] = t;
-                    }
-                    let t = piv[k];
-                    piv[k] = piv[p];
-                    piv[p] = t;
-                    sign = -sign;
-                }
-                let pivot = rk[k];
-                for i in k + 1..n {
-                    let ri = a.data[i * n..(i + 1) * n];
-                    assert(ri.len == n);
-                    let f = ri[k] / pivot;
-                    ri[k] = f;
-                    axpy(-f, rk[k + 1..k1], ri[k + 1..k1]);
-                }
-            }
-            if k1 < o1 {
-                // The panel's block row of U, within the outer block: the unit
-                // lower panel's inverse applied to columns k1..o1 of its rows.
-                for i in k0..k1 {
-                    let ri = row(a, i)[k1..o1];
-                    for t in k0..i { axpy(-a.data[i * n + t], row(a, t)[k1..o1], ri); }
-                }
-                // The rest of the outer block: a22 -= l21 u12.
-                gemm_acc(a, k1, k1, a, k1, k0, false, a, k0, k1, n - k1, o1 - k1, k1 - k0, -1.0);
-            }
-            k0 = k1;
-        }
+        let s, pok = lu_outer_panel(a, piv, o0, o1, nb, swaps);
+        sign *= s;
+        if !pok { ok = false; }
         if o1 < n {
-            // The outer block row of U, columns o1..: the unit lower triangle of
-            // the outer block's inverse, NB rows at a time.
-            var i0 = o0;
-            while i0 < o1 {
-                let i1 = min(i0 + nb, o1);
-                gemm_acc(a, i0, o1, a, i0, o0, false, a, o0, o1, i1 - i0, n - o1, i0 - o0, -1.0);
-                for i in i0..i1 {
-                    let ri = row(a, i)[o1..];
-                    for t in i0..i { axpy(-a.data[i * n + t], row(a, t)[o1..], ri); }
-                }
-                i0 = i1;
-            }
-            // The trailing matrix: a22 -= l21 u12, OB deep.
-            G(a, o1, o1, a, o1, o0, false, a, o0, o1, n - o1, n - o1, o1 - o0, -1.0);
+            lu_swap_rows(a, o1, n, swaps, o0, o1);
+            lu_outer_update(a, o1, n - o1, a, 0, o0, o0, o1, nb, G);
         }
         o0 = o1;
     }
     return sign, ok;
+}
+
+// Swaps each row k in k0..k1 of c with row swaps[k - k0], over columns
+// c0..c1, in order: what the row swaps of a panel do to columns it doesn't
+// hold.
+fn lu_swap_rows(c: matrix&, c0: i64, c1: i64, swaps: i64[:], k0: i64, k1: i64) {
+    let ld = c.cols;
+    for k in k0..k1 {
+        let p = swaps[k - k0];
+        if p == k { continue; }
+        let rk = c.data[k * ld + c0..k * ld + c1];
+        let rp = c.data[p * ld + c0..p * ld + c1];
+        assert(rk.len == c1 - c0 && rp.len == c1 - c0);
+        for j in c1 - c0 {
+            let t = rk[j];
+            rk[j] = rp[j];
+            rp[j] = t;
+        }
+    }
+}
+
+// Factors the outer block of columns o0..o1, rows o0.. of a, a panel of nb
+// columns at a time: each panel picks its pivots, swaps rows, solves for its
+// block row of U within the outer block and updates the rest of the outer
+// block. Returns the swaps' sign and false if a pivot column was zero, and
+// leaves in `swaps` the row swapped with each row o0..o1 (itself when none
+// was). The swaps reach columns 0..o1 of a only: the caller applies them to
+// the columns from o1 on (lu_swap_rows) before lu_outer_update.
+fn lu_outer_panel(a: matrix&, piv: i64[>..]&, o0: i64, o1: i64, nb: i64, swaps: i64[>..]&) -> f64, bool {
+    let n = a.rows;
+    var sign = 1.0;
+    var ok = true;
+    swaps.clear();
+    var b: f64[>..] = [];
+    var k0 = o0;
+    while k0 < o1 {
+        let k1 = min(k0 + nb, o1);
+        let w = k1 - k0;
+        let m = n - k0;
+        // The panel, rows k0.. of columns k0..k1, copied out column-major:
+        // each step below then divides one long contiguous column and folds
+        // it into the columns to its right, loops the C compiler vectorizes.
+        // Every entry sees the same operations in the same order as it would
+        // in a, so the factors are the same bit for bit.
+        b.resize(w * m, 0.0);
+        for i in m {
+            let ri = a.data[(k0 + i) * n + k0..(k0 + i) * n + k1];
+            assert(ri.len == w);
+            for j in w { b[j * m + i] = ri[j]; }
+        }
+        for j in w {
+            let cj = b[j * m..(j + 1) * m];
+            assert(cj.len == m);
+            var p = j;
+            var big = abs(cj[j]);
+            for i in j + 1..m {
+                let v = abs(cj[i]);
+                if v > big { big = v; p = i; }
+            }
+            swaps.push(k0 + p);
+            if big == 0.0 { ok = false; continue; }
+            if p != j {
+                for t in w {
+                    let x = b[t * m + j];
+                    b[t * m + j] = b[t * m + p];
+                    b[t * m + p] = x;
+                }
+                let x = piv[k0 + j];
+                piv[k0 + j] = piv[k0 + p];
+                piv[k0 + p] = x;
+                sign = -sign;
+            }
+            let pivot = cj[j];
+            let l = cj[j + 1..];
+            for i in l.len { l[i] = l[i] / pivot; }
+            for t in j + 1..w {
+                let ct = b[t * m + j..(t + 1) * m];
+                assert(ct.len == l.len + 1);
+                let u = ct[0];
+                let below = ct[1..];
+                assert(below.len == l.len);
+                for i in l.len { below[i] += -l[i] * u; }
+            }
+        }
+        for i in m {
+            let ri = a.data[(k0 + i) * n + k0..(k0 + i) * n + k1];
+            assert(ri.len == w);
+            for j in w { ri[j] = b[j * m + i]; }
+        }
+        // The panel's swaps, on the L to its left and the rest of the outer block.
+        lu_swap_rows(a, 0, k0, swaps[k0 - o0..], k0, k1);
+        lu_swap_rows(a, k1, o1, swaps[k0 - o0..], k0, k1);
+        if k1 < o1 {
+            // The panel's block row of U, within the outer block: the unit
+            // lower panel's inverse applied to columns k1..o1 of its rows.
+            for i in k0..k1 {
+                let ri = row(a, i)[k1..o1];
+                for t in k0..i { axpy(-a.data[i * n + t], row(a, t)[k1..o1], ri); }
+            }
+            // The rest of the outer block: a22 -= l21 u12.
+            gemm_acc(a, k1, k1, a, k1, k0, false, a, k0, k1, n - k1, o1 - k1, k1 - k0, -1.0);
+        }
+        k0 = k1;
+    }
+    return sign, ok;
+}
+
+// After lu_outer_panel factored the outer block o0..o1, brings w columns of
+// c, from column cj, up to date: their block row of U, rows o0..o1, then
+// the trailing rows below, OB deep with one G product. c's rows are a's
+// rows; l holds the factored outer block, a's row i and column o0 at l's
+// row i - lr and column lj. Every column is computed on its own, so the
+// result is the same bit for bit whichever columns, and in whatever groups,
+// c holds.
+fn lu_outer_update<G>(c: matrix&, cj: i64, w: i64, l, lr: i64, lj: i64, o0: i64, o1: i64, nb: i64) {
+    let n = c.rows;
+    let ld = l.cols;
+    // The outer block row of U: the unit lower triangle of the outer
+    // block's inverse, nb rows at a time.
+    var i0 = o0;
+    while i0 < o1 {
+        let i1 = min(i0 + nb, o1);
+        gemm_acc(c, i0, cj, l, i0 - lr, lj, false, c, o0, cj, i1 - i0, w, i0 - o0, -1.0);
+        for i in i0..i1 {
+            let ri = row(c, i)[cj..cj + w];
+            for t in i0..i { axpy(-l.data[(i - lr) * ld + lj + t - o0], row(c, t)[cj..cj + w], ri); }
+        }
+        i0 = i1;
+    }
+    // The trailing matrix: a22 -= l21 u12, OB deep.
+    G(c, o1, cj, l, o1 - lr, lj, false, c, o0, cj, n - o1, w, o1 - o0, -1.0);
 }
 
 // lu_factor_with on this thread: the kernel is gemm_acc.
@@ -641,31 +713,34 @@ fn lu_solve(lu, piv: i64[:], b: f64[:]) -> f64[>..] {
     return solve_upper(lu, y);
 }
 
-fn det_with<G>(a) -> f64 {
+// The LU family below factors with F, lu_factor or another function of its
+// shape (linalg.parallel passes its own), and the solves' products go
+// through G.
+fn det_with<F>(a) -> f64 {
     assert(a.rows == a.cols);
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor_with(lu, piv, G);
+    let sign, ok = F(lu, piv);
     guard ok else { return 0.0; }
     var d = sign;
     for i in a.rows { d *= lu.data[i * a.rows + i]; }
     return d;
 }
 
-// det_with on this thread: the kernel is gemm_acc.
-fn det(a) -> f64 { return det_with(a, gemm_acc); }
+// det_with on this thread: the factorization is lu_factor.
+fn det(a) -> f64 { return det_with(a, lu_factor); }
 
 // Solves a x = b for square a; false when a is singular.
-fn solve_with<G>(a, b: f64[:]) -> f64[>..], bool {
+fn solve_with<F>(a, b: f64[:]) -> f64[>..], bool {
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor_with(lu, piv, G);
+    let sign, ok = F(lu, piv);
     guard ok else { return [], false; }
     return lu_solve(lu, piv, b), true;
 }
 
-// solve_with on this thread: the kernel is gemm_acc.
-fn solve(a, b: f64[:]) -> f64[>..], bool { return solve_with(a, b, gemm_acc); }
+// solve_with on this thread: the factorization is lu_factor.
+fn solve(a, b: f64[:]) -> f64[>..], bool { return solve_with(a, b, lu_factor); }
 
 // The outer block of the two-level factorizations and solves: products
 // this wide in their inner dimension go through G, the kernel the caller
@@ -735,13 +810,13 @@ fn backward_with<G>(lu, x: matrix&) {
 // Solves a x = b for every column of b at once. The substitutions work on
 // whole rows of right-hand sides: row i of x takes a multiple of each row
 // solved before it, so every inner loop runs along a row.
-fn solve_matrix_with<G>(a, b) -> matrix, bool {
+fn solve_matrix_with<F, G>(a, b) -> matrix, bool {
     assert(a.rows == a.cols && a.rows == b.rows);
     let n = a.rows;
     let m = b.cols;
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor_with(lu, piv, G);
+    let sign, ok = F(lu, piv);
     guard ok else { return zeros(0, 0), false; }
     var x = zeros(n, m);
     for i in n { set_block(x, i, 0, submatrix(b, piv[i], piv[i] + 1, 0, m)); }
@@ -750,18 +825,18 @@ fn solve_matrix_with<G>(a, b) -> matrix, bool {
     return x, true;
 }
 
-// solve_matrix_with on this thread: the kernel is gemm_acc.
-fn solve_matrix(a, b) -> matrix, bool { return solve_matrix_with(a, b, gemm_acc); }
+// solve_matrix_with on this thread: lu_factor, and gemm_acc as the kernel.
+fn solve_matrix(a, b) -> matrix, bool { return solve_matrix_with(a, b, lu_factor, gemm_acc); }
 
 // With p a = l u, a^-1 = u^-1 l^-1 p. l^-1 is lower triangular, so the
 // forward pass skips the columns it knows are zero: about 2n^3 flops in all
 // where solving against the identity would take 8n^3/3.
-fn inverse_with<G>(a) -> matrix, bool {
+fn inverse_with<F, G>(a) -> matrix, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     var lu = clone(a);
     var piv: i64[>..] = [];
-    let sign, ok = lu_factor_with(lu, piv, G);
+    let sign, ok = F(lu, piv);
     guard ok else { return zeros(0, 0), false; }
     var x = identity(n);
     forward_unit_with(lu, x, true, G);     // x = l^-1
@@ -777,8 +852,8 @@ fn inverse_with<G>(a) -> matrix, bool {
     return inv, true;
 }
 
-// inverse_with on this thread: the kernel is gemm_acc.
-fn inverse(a) -> matrix, bool { return inverse_with(a, gemm_acc); }
+// inverse_with on this thread: lu_factor, and gemm_acc as the kernel.
+fn inverse(a) -> matrix, bool { return inverse_with(a, lu_factor, gemm_acc); }
 
 // ---------------------------------------------------------------------------
 // Cholesky decomposition

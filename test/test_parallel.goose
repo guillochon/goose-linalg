@@ -52,6 +52,10 @@ fn run(threads: i64) {
 
         let s2, ok2 = linalg::lu_factor(lu2, p2);
         check(ok1 == ok2 && s1 == s2 && p1 == p2 && same(lu1, lu2), str("lu_factor", what));
+        var lu3 = linalg::clone(a);
+        var p3: i64[>..] = [];
+        let s3, ok3 = linalg::lu_factor_oc(lu3, p3);
+        check(ok3 == ok2 && s3 == s2 && p3 == p2 && same(lu3, lu2), str("lu_factor_oc", what));
         check(linalg::det_mt(a) == linalg::det(a), str("det", what));
         let rhs = linalg::col(b, 0);
         let x1, xo1 = linalg::solve_mt(a, rhs);
@@ -79,6 +83,11 @@ fn main() {
     // tall times square splits rows, square times wide splits columns.
     linalg::set_parallel_always(true);
     for t in [1, 2, 3, 6] { run(t); }
+    // Again with the LU family owner-computes past one outer block, the
+    // last past the worker slots it has.
+    linalg::set_owner_computes_from(linalg::OB + 1);
+    for t in [3, 6, 10] { run(t); }
+    linalg::set_owner_computes_from(linalg::LU_OC_MIN);
     linalg::set_parallel_always(false);
 
     // The cost model on its own: a large product pays for its copies, a
