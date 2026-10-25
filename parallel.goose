@@ -1,6 +1,6 @@
 // linalg.parallel: multithreaded versions of linalg's heavy operations.
 //
-//   import linalg from "guillochon/goose-linalg@v0.3.2";
+//   import linalg from "guillochon/goose-linalg@v0.3.3";
 //   import linalg.parallel;
 //
 //   linalg::set_threads(6);              // optional; hardware_threads() by default
@@ -74,10 +74,12 @@ let MT_MIN_FLOPS = 2.0e6;
 // What a flop costs in gemm_acc, and what a number costs to cross a queue
 // to a worker and back into place, in nanoseconds (an i5-12600K with
 // AVX2). They decide only whether sharing a product out pays: with these,
-// matmul_mt shares from about n = 120 on 6 threads, and measured faster
-// than matmul from n = 150.
+// matmul_mt shares from about n = 190 on 6 threads (it measured faster than
+// matmul from n = 150), and the LU's 256-deep updates at n = 400, which
+// gained nothing, stay on the calling thread. At 0.5 they were shared, and
+// solve_mt there ran 2-5% behind solve.
 let FLOP_NS = 0.025;
-let COPY_NS = 0.5;
+let COPY_NS = 0.8;
 
 // What a number costs the calling thread to send its parts out, in
 // nanoseconds, for sizing its own share: half what the sends measured (1.2),
