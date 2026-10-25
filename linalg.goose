@@ -626,32 +626,74 @@ simd fn lu_outer_panel(a: matrix&, piv: i64[>..]&, o0: i64, o1: i64, nb: i64, sw
     var ok = true;
     swaps.clear();
     var b: f64[>..] = [];
+    var zero: bool[>..] = [];
     var k0 = o0;
     while k0 < o1 {
         let k1 = min(k0 + nb, o1);
         let w = k1 - k0;
         let m = n - k0;
         // The panel, rows k0.. of columns k0..k1, copied out column-major:
-        // each step below then divides one long contiguous column and folds
-        // it into the columns to its right, loops the C compiler vectorizes.
-        // Every entry sees the same operations in the same order as it would
-        // in a, so the factors are the same bit for bit.
+        // each step below then works down long contiguous columns, loops the
+        // C compiler vectorizes. Every entry sees the same operations in the
+        // same order as it would in a, so the factors are the same bit for
+        // bit.
         b.resize(w * m, 0.0);
         for i in m {
             let ri = a.data[(k0 + i) * n + k0..(k0 + i) * n + k1];
             assert(ri.len == w);
             for j in w { b[j * m + i] = ri[j]; }
         }
+        // Each column takes the updates of the columns to its left when its
+        // turn comes, rather than as each of them is factored: the same
+        // updates in the same order, but four columns' of them in one pass
+        // over the column. The row swaps in between move each entry and the
+        // multipliers it is updated with together, so they commute with the
+        // delay. A column that was all zeros updates nothing, as before.
+        zero.clear();
         for j in w {
             let cj = b[j * m..(j + 1) * m];
             assert(cj.len == m);
-            var p = j;
-            var big = abs(cj[j]);
-            for i in j + 1..m {
-                let v = abs(cj[i]);
-                if v > big { big = v; p = i; }
+            var q = 0;
+            while q < j {
+                if q + 4 <= j && !zero[q] && !zero[q + 1] && !zero[q + 2] && !zero[q + 3] {
+                    let l0 = b[q * m..(q + 1) * m];
+                    let l1 = b[(q + 1) * m..(q + 2) * m];
+                    let l2 = b[(q + 2) * m..(q + 3) * m];
+                    let l3 = b[(q + 3) * m..(q + 4) * m];
+                    assert(l0.len == m && l1.len == m && l2.len == m && l3.len == m);
+                    // Rows q + 1..q + 3 are within the four: each takes the
+                    // updates of the columns above it, and becomes the next
+                    // column's multiplier of U.
+                    let u0 = cj[q];
+                    cj[q + 1] = cj[q + 1] + -l0[q + 1] * u0;
+                    let u1 = cj[q + 1];
+                    cj[q + 2] = cj[q + 2] + -l0[q + 2] * u0 + -l1[q + 2] * u1;
+                    let u2 = cj[q + 2];
+                    cj[q + 3] = cj[q + 3] + -l0[q + 3] * u0 + -l1[q + 3] * u1 + -l2[q + 3] * u2;
+                    let u3 = cj[q + 3];
+                    let c = cj[q + 4..];
+                    let a0 = l0[q + 4..];
+                    let a1 = l1[q + 4..];
+                    let a2 = l2[q + 4..];
+                    let a3 = l3[q + 4..];
+                    assert(a0.len == c.len && a1.len == c.len && a2.len == c.len && a3.len == c.len);
+                    for i in c.len { c[i] = c[i] + -a0[i] * u0 + -a1[i] * u1 + -a2[i] * u2 + -a3[i] * u3; }
+                    q += 4;
+                } else {
+                    if !zero[q] {
+                        let u = cj[q];
+                        let lq = b[q * m + q + 1..(q + 1) * m];
+                        let below = cj[q + 1..];
+                        assert(lq.len == below.len);
+                        for i in below.len { below[i] += -lq[i] * u; }
+                    }
+                    q++;
+                }
             }
+            let p = j + abs_argmax(cj[j..]);
+            let big = abs(cj[p]);
             swaps.push(k0 + p);
+            zero.push(big == 0.0);
             if big == 0.0 { ok = false; continue; }
             if p != j {
                 for t in w {
@@ -667,14 +709,6 @@ simd fn lu_outer_panel(a: matrix&, piv: i64[>..]&, o0: i64, o1: i64, nb: i64, sw
             let pivot = cj[j];
             let l = cj[j + 1..];
             for i in l.len { l[i] = l[i] / pivot; }
-            for t in j + 1..w {
-                let ct = b[t * m + j..(t + 1) * m];
-                assert(ct.len == l.len + 1);
-                let u = ct[0];
-                let below = ct[1..];
-                assert(below.len == l.len);
-                for i in l.len { below[i] += -l[i] * u; }
-            }
         }
         for i in m {
             let ri = a.data[(k0 + i) * n + k0..(k0 + i) * n + k1];
@@ -687,16 +721,82 @@ simd fn lu_outer_panel(a: matrix&, piv: i64[>..]&, o0: i64, o1: i64, nb: i64, sw
         if k1 < o1 {
             // The panel's block row of U, within the outer block: the unit
             // lower panel's inverse applied to columns k1..o1 of its rows.
-            for i in k0..k1 {
-                let ri = row(a, i)[k1..o1];
-                for t in k0..i { axpy(-a.data[i * n + t], row(a, t)[k1..o1], ri); }
-            }
+            unit_lower_rows(a, k0, k1, k1, o1 - k1, a, 0, 0);
             // The rest of the outer block: a22 -= l21 u12.
             gemm_acc(a, k1, k1, a, k1, k0, false, a, k0, k1, n - k1, o1 - k1, k1 - k0, -1.0);
         }
         k0 = k1;
     }
     return sign, ok;
+}
+
+// The index of the first entry of x with the largest magnitude: the first i
+// with |x[i]| > |x[t]| for every t < i, and |x[i]| >= the rest. A NaN never
+// counts as larger, so a NaN at x[0] gives 0. The maximum is found in
+// LANES running maxima, which vectorize, then the first entry equal to it.
+simd fn abs_argmax(x: f64[:]) -> i64 {
+    let n = x.len;
+    assert(n >= 1);
+    var big = abs(x[0]);
+    if n < 2 * LANES || big != big {
+        var p = 0;
+        for i in 1..n {
+            let v = abs(x[i]);
+            if v > big { big = v; p = i; }
+        }
+        return p;
+    }
+    var lane: f64[LANES] = [0.0; LANES];
+    for &v in lane { v = big; }
+    let m = n - n % LANES;
+    var i = 0;
+    while i < m {
+        let xs = x[i..i + LANES];
+        assert(xs.len == LANES);
+        for k in LANES {
+            let v = abs(xs[k]);
+            lane[k] = if v > lane[k] { v } else { lane[k] };
+        }
+        i += LANES;
+    }
+    for k in LANES { if lane[k] > big { big = lane[k]; } }
+    for t in m..n {
+        let v = abs(x[t]);
+        if v > big { big = v; }
+    }
+    for t in n {
+        if abs(x[t]) == big { return t; }
+    }
+    return 0;
+}
+
+// For each row i of i0..i1 in order, columns cj..cj + w of c: row i less
+// the sum over t in i0..i of L(i, t) times row t, where L(i, t) is
+// l[i - lr][lc + t]: a unit lower triangle's inverse applied to those rows.
+// Each row takes the rows above it as axpy would, one at a time in order,
+// but four at a time in one pass over the row.
+simd fn unit_lower_rows(c: matrix&, i0: i64, i1: i64, cj: i64, w: i64, l, lr: i64, lc: i64) {
+    let ld = l.cols;
+    for i in i0..i1 {
+        let ri = row(c, i)[cj..cj + w];
+        assert(ri.len == w);
+        fn coef(t: i64) -> f64 { -l.data[(i - lr) * ld + lc + t] }
+        var t = i0;
+        while t + 4 <= i {
+            let x0 = row(c, t)[cj..cj + w];
+            let x1 = row(c, t + 1)[cj..cj + w];
+            let x2 = row(c, t + 2)[cj..cj + w];
+            let x3 = row(c, t + 3)[cj..cj + w];
+            assert(x0.len == w && x1.len == w && x2.len == w && x3.len == w);
+            let a0 = coef(t);
+            let a1 = coef(t + 1);
+            let a2 = coef(t + 2);
+            let a3 = coef(t + 3);
+            for j in w { ri[j] = ri[j] + a0 * x0[j] + a1 * x1[j] + a2 * x2[j] + a3 * x3[j]; }
+            t += 4;
+        }
+        for t in t..i { axpy(coef(t), row(c, t)[cj..cj + w], ri); }
+    }
 }
 
 // After lu_outer_panel factored the outer block o0..o1, brings w columns of
@@ -708,17 +808,13 @@ simd fn lu_outer_panel(a: matrix&, piv: i64[>..]&, o0: i64, o1: i64, nb: i64, sw
 // c holds.
 fn lu_outer_update<G>(c: matrix&, cj: i64, w: i64, l, lr: i64, lj: i64, o0: i64, o1: i64, nb: i64) {
     let n = c.rows;
-    let ld = l.cols;
     // The outer block row of U: the unit lower triangle of the outer
     // block's inverse, nb rows at a time.
     var i0 = o0;
     while i0 < o1 {
         let i1 = min(i0 + nb, o1);
         gemm_acc(c, i0, cj, l, i0 - lr, lj, false, c, o0, cj, i1 - i0, w, i0 - o0, -1.0);
-        for i in i0..i1 {
-            let ri = row(c, i)[cj..cj + w];
-            for t in i0..i { axpy(-l.data[(i - lr) * ld + lj + t - o0], row(c, t)[cj..cj + w], ri); }
-        }
+        unit_lower_rows(c, i0, i1, cj, w, l, lr, lj - o0);
         i0 = i1;
     }
     // The trailing matrix: a22 -= l21 u12, OB deep.
