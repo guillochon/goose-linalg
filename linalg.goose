@@ -236,8 +236,9 @@ fn gemm_acc(c: matrix&, ci: i64, cj: i64, a, ai: i64, aj: i64, trans_a: bool,
 }
 
 // The cache blocks of gemm_acc: KC steps of the inner dimension by NC
-// columns, 256 x 512 doubles, a megabyte.
-let KC = 256;
+// columns, 128 x 512 doubles, half a megabyte: small enough to stay in L2
+// alongside the rows of a and c (256 deep ran 4-5% slower from n = 800).
+let KC = 128;
 let NC = 512;
 
 // gemm_acc on one cache block. Loops run i-k-j, so the innermost runs along
@@ -898,8 +899,8 @@ fn inverse(a) -> matrix, bool { return inverse_with(a, lu_factor, gemm_acc); }
 // NB columns at a time, factor the diagonal block and the panel below it,
 // then subtract the panel's outer product from the rest of the outer block
 // with gemm_acc; then subtract the outer block's outer product from the
-// whole trailing matrix with G.
-fn cholesky_with<G>(a) -> matrix, bool {
+// whole trailing matrix with G, in strips of `strip` rows.
+fn cholesky_with<G>(a, strip: i64) -> matrix, bool {
     assert(a.rows == a.cols);
     let n = a.rows;
     var l = zeros(n, n);
@@ -916,28 +917,13 @@ fn cholesky_with<G>(a) -> matrix, bool {
         var k0 = o0;
         while k0 < o1 && ok {
             let k1 = min(k0 + NB, o1);
-            // The panel, columns k0..k1. Entry (i, j) is the trailing value
-            // less a dot product of rows i and j of l, from column k0 up to j.
-            for j in k0..k1 {
-                let lj = row(l, j);
-                assert(lj.len == n);
-                let head = lj[k0..j];
-                let d = lj[j] - dot(head, head);
-                if d <= 0.0 || d != d { ok = false; break; }
-                let ljj = sqrt(d);
-                lj[j] = ljj;
-                for i in j + 1..n {
-                    let li = row(l, i);
-                    assert(li.len == n);
-                    li[j] = (li[j] - dot(li[k0..j], head)) / ljj;
-                }
-            }
+            ok = cholesky_panel(l, k0, k1);
             // The rest of the outer block's columns: a -= l21 l21^T.
             if ok && k1 < o1 { cholesky_update(l, k0, k1, k1, o1, NB, gemm_acc); }
             k0 = k1;
         }
-        // The whole trailing matrix, OB deep, in strips tall enough to share.
-        if ok && o1 < n { cholesky_update(l, o0, o1, o1, n, OB, G); }
+        // The whole trailing matrix, OB deep.
+        if ok && o1 < n { cholesky_update(l, o0, o1, o1, n, strip, G); }
         o0 = o1;
     }
     for i in n {
@@ -945,6 +931,75 @@ fn cholesky_with<G>(a) -> matrix, bool {
         for j in i + 1..n { li[j] = 0.0; }
     }
     return l, ok;
+}
+
+// Factors the panel of columns k0..k1, rows k0.. of l: entry (i, j) is the
+// trailing value less the sum over t in k0..j of l[i][t] l[j][t], divided by
+// the diagonal. False, with the failing column left as it was, when a
+// diagonal is not positive.
+//
+// The panel is factored in a column-major copy, so each column's sums run
+// down long contiguous columns: for each t in order, the whole column of
+// sums takes l[i][t] l[j][t]. That is the order a dot product of rows i and j
+// adds them in (fewer than 2 * LANES terms, so dot's single running sum),
+// so the result is bit for bit the row-by-row one.
+simd fn cholesky_panel(l: matrix&, k0: i64, k1: i64) -> bool {
+    let n = l.rows;
+    let w = k1 - k0;
+    let h = n - k0;
+    assert(0 <= k0 && k0 <= k1 && k1 <= n && w <= 2 * LANES);
+    // p row c is column k0 + c of l, from row k0 down.
+    var p = zeros(w, h);
+    for i in h {
+        let li = row(l, k0 + i)[k0..k1];
+        assert(li.len == w);
+        for c in w { p.data[c * h + i] = li[c]; }
+    }
+    var s: f64[>..] = [];
+    s.resize(h, 0.0);
+    var ok = true;
+    var done = 0;
+    for j in w {
+        let sj = s[j..h];
+        for &x in sj { x = 0.0; }
+        // Four columns a pass, added one after another as one at a time
+        // would, with a quarter of the loads and stores of the sums.
+        var t = 0;
+        while t + 4 <= j {
+            let p0 = row(p, t)[j..h];
+            let p1 = row(p, t + 1)[j..h];
+            let p2 = row(p, t + 2)[j..h];
+            let p3 = row(p, t + 3)[j..h];
+            assert(p0.len == sj.len && p1.len == sj.len && p2.len == sj.len && p3.len == sj.len);
+            let f0 = p0[0];
+            let f1 = p1[0];
+            let f2 = p2[0];
+            let f3 = p3[0];
+            for i in sj.len { sj[i] = sj[i] + p0[i] * f0 + p1[i] * f1 + p2[i] * f2 + p3[i] * f3; }
+            t += 4;
+        }
+        for t in t..j {
+            let pt = row(p, t)[j..h];
+            assert(pt.len == sj.len);
+            let f = pt[0];
+            for i in sj.len { sj[i] += pt[i] * f; }
+        }
+        let pj = row(p, j)[j..h];
+        assert(pj.len == sj.len);
+        let d = pj[0] - sj[0];
+        if d <= 0.0 || d != d { ok = false; break; }
+        let ljj = sqrt(d);
+        pj[0] = ljj;
+        for i in 1..pj.len { pj[i] = (pj[i] - sj[i]) / ljj; }
+        done++;
+    }
+    // Back into l: the factored columns, on and below the diagonal.
+    for i in h {
+        let li = row(l, k0 + i)[k0..k1];
+        assert(li.len == w);
+        for c in min(done, i + 1) { li[c] = p.data[c * h + i]; }
+    }
+    return ok;
 }
 
 // Subtracts l[r.., k0..k1] l[r.., k0..k1]^T from the lower triangle of
@@ -963,14 +1018,29 @@ fn cholesky_update<G>(l: matrix&, k0: i64, k1: i64, r: i64, c1: i64, strip: i64)
     }
     var s0 = r;
     while s0 < n {
+        // Rows past c1 are a rectangle with no diagonal to stop at: one call.
+        // Strips are multiples of four from r, so its rows still group into
+        // fours where the strips' rows did.
+        if s0 >= c1 {
+            G(l, s0, r, l, s0, k0, false, lt, 0, 0, n - s0, c1 - r, k1 - k0, -1.0);
+            break;
+        }
         let s1 = min(s0 + strip, n);
         G(l, s0, r, l, s0, k0, false, lt, 0, 0, s1 - s0, min(s1, c1) - r, k1 - k0, -1.0);
         s0 = s1;
     }
 }
 
-// cholesky_with on this thread: the kernel is gemm_acc.
-fn cholesky(a) -> matrix, bool { return cholesky_with(a, gemm_acc); }
+// cholesky_with on this thread: the kernel is gemm_acc, in strips of
+// CHOL_STRIP rows.
+fn cholesky(a) -> matrix, bool { return cholesky_with(a, CHOL_STRIP, gemm_acc); }
+
+// The strips of cholesky's trailing updates. Each strip computes the square
+// on the diagonal whole, half of it above the diagonal and thrown away, so
+// short strips waste less; gemm_acc runs as fast on 64 rows as on 256. A
+// multiple of four, so rows group into gemm_acc's four-row blocks as they do
+// in one tall strip, and the result is the same bit for bit.
+let CHOL_STRIP = 32;
 
 // Solves a x = b given a's Cholesky factor l.
 fn cholesky_solve(l, b: f64[:]) -> f64[>..] {

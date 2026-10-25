@@ -5,7 +5,7 @@ build step, nothing to install. An optional module, `linalg.parallel`, runs the 
 several threads.
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.3.0";   // or from "../goose-linalg" for a local checkout
+import linalg from "guillochon/goose-linalg@v0.3.1";   // or from "../goose-linalg" for a local checkout
 
 fn main() {
     let a = linalg::from_rows(3, 3, [4, 1, 2, 1, 3, 0, 2, 0, 5]);
@@ -67,7 +67,10 @@ first, until `goose fetch --update`.
   triangular solves behind `solve_matrix` and `inverse` are blocked the same two ways. `inverse`
   also skips the zeros of L⁻¹, so it costs about 2n³ flops rather than 2⅔n³.
 - `cholesky` is blocked the same way, as `potrf`: 32-column panels within 256-column outer
-  blocks, each level updating its trailing lower triangle with matrix multiplies.
+  blocks, each level updating its trailing lower triangle with matrix multiplies. Like the LU,
+  each panel is factored in a column-major copy. The trailing updates run in strips of 32 rows,
+  so they compute little of the triangle above the diagonal (`cholesky_mt` keeps strips of 256,
+  tall enough to share).
 - `qr` uses Householder reflections, blocked as `geqrf`/`orgqr` with the compact WY form. The 32
   reflectors of a panel combine into I − V·T·Vᵀ, so the rest of R, and later Q, take each block
   as two matrix multiplies. `lstsq` solves through QR and refuses rank-deficient input rather
@@ -142,7 +145,7 @@ the compiler build the worker threads' copy of the kernel with a different summa
 ## Multithreading
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.3.0";
+import linalg from "guillochon/goose-linalg@v0.3.1";
 import linalg.parallel;
 
 fn main() {
@@ -261,8 +264,8 @@ At n = 400:
 - `solve`, `det` and `matvec` match OpenBLAS, and `inverse`, `cholesky` and `qr` beat it.
 - `matmul` runs at 51 GFLOP/s against OpenBLAS's 62. It is the furthest behind, at 1.2–1.4× at
   every size, because Goose's C never uses FMA (see Building for speed).
-- The middle sizes are the next gap: at n = 100–200, `cholesky` is 1.3–1.55× behind, and `solve`
-  and `det` 1.15×.
+- The middle sizes are the next gap: at n = 100–200, `solve` and `det` are 1.15× behind, and
+  `cholesky` 1.16× at n = 200 (it is ahead at n = 100).
 
 At n = 50, almost everything is faster than NumPy, whose call overhead dominates there.
 
@@ -278,8 +281,8 @@ What makes the kernels fast:
   rows of the result by four steps of the inner dimension. `matmul` is a single call to it, and
   the blocked LU, Cholesky, QR and the eigenvector/singular-vector bases do most of their work in
   it.
-- Large products go through the right-hand operand in cache blocks of 256 × 512, so a product
-  bigger than the caches runs nearly as fast as one that fits.
+- Large products go through the right-hand operand in cache blocks of 128 × 512, half a megabyte
+  that stays in L2, so a product bigger than the caches runs nearly as fast as one that fits.
 
 `eigh` and `svd` follow LAPACK's divide-and-conquer drivers past 64 rows or columns (see
 Algorithms). Before that, their QL and QR iterations spent over half their time on plane rotations,

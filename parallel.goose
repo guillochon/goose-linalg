@@ -1,6 +1,6 @@
 // linalg.parallel: multithreaded versions of linalg's heavy operations.
 //
-//   import linalg from "guillochon/goose-linalg@v0.3.0";
+//   import linalg from "guillochon/goose-linalg@v0.3.1";
 //   import linalg.parallel;
 //
 //   linalg::set_threads(6);              // optional; hardware_threads() by default
@@ -278,7 +278,8 @@ fn inverse_mt(a) -> matrix, bool {
 
 fn cholesky_mt(a) -> matrix, bool {
     if serial_here(a.rows) { return cholesky(a); }
-    return cholesky_with(a, gemm_mt);
+    // Strips tall enough for gemm_mt to share.
+    return cholesky_with(a, OB, gemm_mt);
 }
 
 // ---------------------------------------------------------------------------
