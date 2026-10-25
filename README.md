@@ -169,19 +169,31 @@ below). Either way the results are **bit for bit the serial ones** under IEEE fl
 under `/fp:fast`).
 
 Goose threads share no memory: a worker is a separate program, and its operands and results are
-copied through typed queues. On the test machine a number costs about 1.6 ns to cross a queue
-(each message is a fresh allocation), so sharing a product pays only when it does enough work per
-number copied. `gemm_mt` estimates both sides, and keeps any product that wouldn't pay on the
-calling thread.
+copied through typed queues. Every message is a fresh allocation, and on Windows one much past
+half a megabyte comes straight from the operating system, its pages faulting in as it fills. On
+the test machine a number cost 2.4–3 ns to cross a queue in messages of 512K numbers or more,
+against 0.2–0.4 ns in messages of 32K or fewer. So every matrix crosses in parts of 8K numbers,
+and each worker keeps its buffers from one job to the next.
+
+`gemm_mt` gives each worker a share of the product's rows (or columns):
+- Every worker needs the whole of one operand. It goes down a chain of the workers, each passing
+  every part on to the next as it arrives, so the calling thread sends it once.
+- A worker multiplies as that operand arrives, 128 rows of it at a time, rather than waiting for
+  all of it.
+- The calling thread sends before it multiplies, so it keeps a smaller share, sized to finish with
+  the workers.
+
+Sharing a product pays only when it does enough work per number copied. `gemm_mt` estimates both
+sides, and keeps any product that wouldn't pay on the calling thread.
 
 That limits what an LU factorization can gain from `gemm_mt`. Each 256-deep outer update would
 send the whole trailing matrix out and bring it back, so the copies grow as n³ like the work
-does, and adding threads never pays for them. So from n = 1100, on 3 threads or more, the LU
+does, and adding threads never pays for them. So from n = 800, on 3 threads or more, the LU
 family factors **owner-computes** instead, as distributed-memory LAPACK (ScaLAPACK) does:
 - The columns past the first outer block are dealt to the workers in 32-column blocks, and stay
   there.
 - Each step, the calling thread factors the 256-column panel and sends it, with its row swaps, down
-  a tree of workers. Each worker passes the panel on to two more before it starts its own columns.
+  a tree of workers. Each worker passes every part of the panel on to two more as it arrives.
 - Each worker updates the next panel's columns first and sends them straight back, so the calling
   thread can factor them while the workers update the rest.
 
@@ -195,39 +207,39 @@ task as soon as they're free. `inverse_mt` sends no right-hand sides at all: eac
 own columns of the identity.
 
 Goose has one queue per message type, read by every worker. A message for one worker therefore
-needs a type of its own, and these owner-computes paths use at most 8 workers. The tree is the
-same for every message in a call, so each worker gets every message from one sender, in order.
+needs a type of its own: `gemm_mt` uses at most 16 workers, and the owner-computes paths at most
+8. The tree is the same for every message in a call, so each worker gets every message from one
+sender, in order.
 
 In practice:
 
-- `matmul_mt` pays from about n = 500.
+- `matmul_mt` pays from about n = 150.
 - The LU family (`lu_factor_mt`, `det_mt`, `solve_mt`, `solve_matrix_mt`, `inverse_mt`) factors
-  owner-computes from n = 1100 on 3 threads or more. Below that, or on 2 threads, it shares its
-  256-deep outer updates through `gemm_mt`, which pays from about n = 1000.
+  owner-computes from n = 800 on 3 threads or more. Below that, or on 2 threads, it shares its
+  256-deep outer updates through `gemm_mt`, which pays from about n = 700.
 - `inverse_mt` solves owner-computes from n = 600. `solve_matrix_mt` does too, when `b` has at
   least half as many columns as rows. With fewer right-hand sides, sending every worker the
   factored matrix costs more than the solves: at n = 1600 on 6 threads, 39 ms against 4 ms serial
   for 16 columns. So narrower `b` share their products through `gemm_mt`.
 - `cholesky_mt` shares the part of its outer updates left of the diagonal through `gemm_mt`. On 6
-  threads it ran at serial speed up to n = 1600: the serial factorization is fast enough that
-  the copies eat what sharing saves.
+  threads it ran at serial speed up to n = 800, and 1.15–1.2× faster at n = 1600.
 - Up to n = 256 the factorizations are the serial code.
 - `qr`, `lstsq`, `eigh` and `svd` have no `_mt` versions. Their products are blocks of 32
   reflectors, too narrow ever to pay for the copies.
 
 The thresholds come from 2, 3, 4 and 6 threads on the test machine:
-- **Factorization:** owner-computes overtook `gemm_mt`'s LU from n = 1000 on 3 and 4 threads, and
-  from n = 1100 on 6. On 2 threads it ran about 20% behind `gemm_mt` up to n = 1400, because one
-  worker can't hide the serial panels.
-- **Solves:** owner-computes won from n = 600 on every thread count.
+- **Factorization:** owner-computes beat `gemm_mt`'s LU at n = 800 on 3, 4 and 6 threads, and lost
+  at n = 700 on 6. On 2 threads it ran about 35% behind the serial code at n = 800–1000, because
+  one worker can't hide the serial panels.
+- **Solves:** owner-computes won from n = 600 on every thread count (measured before the parts
+  above; not re-tuned since).
 
-An `_mt` function ran at most 4% slower than its serial version, within noise, in these runs:
-- every `_mt` function at n = 400, 800 and 1600 on 6 threads;
-- the LU factorization from n = 600 to 1400 on 2, 3, 4 and 6 threads;
-- `solve_matrix_mt` and `inverse_mt` from n = 400 to 1000 on 2, 3, 4 and 6 threads.
+An `_mt` function ran at most 2% slower than its serial version, within noise, in these runs:
+- every `_mt` function at n = 200, 400, 800 and 1600 on 6 threads;
+- every `_mt` function at n = 200, 400, 800 and 1200 on 2, 3 and 4 threads.
 
-The worst case was `solve_mt` at 0.96× at n = 800. Where there is enough work to share, the `_mt`
-functions are faster.
+The worst case was `inverse_mt` at 0.98× at n = 400 on 3 threads. Where there is enough work to
+share, the `_mt` functions are faster.
 
 On a CPU with performance and efficiency cores, set the thread count to the number of performance
 cores. Call the `_mt` functions from main's thread: they share one pool and its queues, which live
@@ -376,7 +388,7 @@ Its 557 checks require every `_mt` result to equal the serial one bit for bit, a
 through both ways of sharing a product (by rows and by columns), across a pool restart and a
 resize. They also check that large products go to the pool and small ones don't. The LU family is
 checked a second time with owner-computes factorization and solves switched on from n = 257, on
-2, 3, 6 and 10 threads (10 is more than the 8 worker slots), and with right-hand sides too few
+2, 3, 6 and 10 threads (10 is more than their 8 worker slots), and with right-hand sides too few
 for every thread to get a task. After those calls, every queue must be empty: a message left
 behind would be read by the next call.
 

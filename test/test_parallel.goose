@@ -35,20 +35,37 @@ fn left_over<T>(n: i64) -> i64 {
     return k;
 }
 
+// The queues of one worker slot S.
+fn slot_left_over<S>(n: i64) -> i64 {
+    var k = left_over<linalg::lu_msg<S>>(n);
+    k = left_over<linalg::lu_part<S>>(k);
+    k = left_over<linalg::mt_hdr<S>>(k);
+    k = left_over<linalg::mt_part<S>>(k);
+    k = left_over<linalg::mt_dup<S>>(k);
+    return k;
+}
+
 fn queues_empty() -> bool {
-    var k = left_over<linalg::mt_job>(0);
-    k = left_over<linalg::mt_done>(k);
+    var k = left_over<linalg::mt_done>(0);
     k = left_over<linalg::lu_cols>(k);
     k = left_over<linalg::solve_task>(k);
     k = left_over<linalg::solve_done>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s0>>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s1>>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s2>>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s3>>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s4>>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s5>>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s6>>(k);
-    k = left_over<linalg::lu_msg<linalg::lu_s7>>(k);
+    k = slot_left_over<linalg::lu_s0>(k);
+    k = slot_left_over<linalg::lu_s1>(k);
+    k = slot_left_over<linalg::lu_s2>(k);
+    k = slot_left_over<linalg::lu_s3>(k);
+    k = slot_left_over<linalg::lu_s4>(k);
+    k = slot_left_over<linalg::lu_s5>(k);
+    k = slot_left_over<linalg::lu_s6>(k);
+    k = slot_left_over<linalg::lu_s7>(k);
+    k = slot_left_over<linalg::lu_s8>(k);
+    k = slot_left_over<linalg::lu_s9>(k);
+    k = slot_left_over<linalg::lu_s10>(k);
+    k = slot_left_over<linalg::lu_s11>(k);
+    k = slot_left_over<linalg::lu_s12>(k);
+    k = slot_left_over<linalg::lu_s13>(k);
+    k = slot_left_over<linalg::lu_s14>(k);
+    k = slot_left_over<linalg::lu_s15>(k);
     return k == 0;
 }
 
@@ -128,10 +145,10 @@ fn main() {
     var before = linalg::parallel_jobs();
     check(same(linalg::matmul_mt(big_a, big_b), linalg::matmul(big_a, big_b)), "700 x 700 matmul, cost model");
     check(linalg::parallel_jobs() - before == 5, "a 700 x 700 matmul goes to the pool");
-    let mid = linalg::random(150, 150, gm);
+    let mid = linalg::random(80, 80, gm);
     before = linalg::parallel_jobs();
     let mm = linalg::matmul_mt(mid, mid);
-    check(linalg::parallel_jobs() == before, "a 150 x 150 matmul stays on the calling thread");
+    check(linalg::parallel_jobs() == before, "an 80 x 80 matmul stays on the calling thread");
     // Past one outer block (256), the factorizations' outer updates and
     // the solves' outer products are deep enough to share out, and at 1200
     // (four outer blocks and a remainder) they pay for their copies.
