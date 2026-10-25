@@ -69,8 +69,8 @@ first, until `goose fetch --update`.
 - `cholesky` is blocked the same way, as `potrf`: 32-column panels within 256-column outer
   blocks, each level updating its trailing lower triangle with matrix multiplies. Like the LU,
   each panel is factored in a column-major copy. The trailing updates run in strips of 32 rows,
-  so they compute little of the triangle above the diagonal (`cholesky_mt` keeps strips of 256,
-  tall enough to share).
+  so they compute little of the triangle above the diagonal. `cholesky_mt` keeps strips of 256
+  rows, tall enough to share, and takes each strip's diagonal block in strips of 32.
 - `qr` uses Householder reflections, blocked as `geqrf`/`orgqr` with the compact WY form. The 32
   reflectors of a panel combine into I − V·T·Vᵀ, so the rest of R, and later Q, take each block
   as two matrix multiplies. `lstsq` solves through QR and refuses rank-deficient input rather
@@ -118,7 +118,7 @@ targets baseline x86-64 (SSE2).
 
 - **Under clang:** `linalg`'s hot kernels are `simd fn`s. Goose builds each for baseline x86-64
   and again for AVX2 and AVX-512, and picks the widest the CPU has at run time. A plain
-  `goose build` therefore ran within 2% of a build with AVX2 throughout (6% for `cholesky`), and
+  `goose build` therefore ran within 3% of a build with AVX2 at n = 400 and 6% at smaller sizes, and
   the matrix multiply ran at twice the speed it gets without `simd`.
 - **Under MSVC:** `simd` does nothing (Goose builds one version), so enable AVX2 yourself before
   building:
@@ -137,7 +137,7 @@ targets baseline x86-64 (SSE2).
 
 Don't use `/fp:fast` or `-ffast-math`. Under clang they do bring FMA back. The disassembly
 showed 2,124 vector FMA instructions against none, and the matrix multiply took 26% less time at
-n = 400, at 69 GFLOP/s, ahead of OpenBLAS's 62. But they break IEEE semantics: under `/fp:fast`, MSVC folds `1.0 / 0.0` to
+n = 400, at 68 GFLOP/s, ahead of OpenBLAS's 62. But they break IEEE semantics: under `/fp:fast`, MSVC folds `1.0 / 0.0` to
 `1e300`, and checks for NaN and infinity stop working. One check in the test suite fails under
 it. It also ends `linalg.parallel`'s bit-for-bit match with the serial results: fast-math lets
 the compiler build the worker threads' copy of the kernel with a different summation order.
@@ -207,7 +207,9 @@ In practice:
   least half as many columns as rows. With fewer right-hand sides, sending every worker the
   factored matrix costs more than the solves: at n = 1600 on 6 threads, 39 ms against 4 ms serial
   for 16 columns. So narrower `b` share their products through `gemm_mt`.
-- `cholesky_mt` shares its outer updates through `gemm_mt`, from about n = 1000.
+- `cholesky_mt` shares the part of its outer updates left of the diagonal through `gemm_mt`. On 6
+  threads it ran at serial speed up to n = 1600: the serial factorization is fast enough that
+  the copies eat what sharing saves.
 - Up to n = 256 the factorizations are the serial code.
 - `qr`, `lstsq`, `eigh` and `svd` have no `_mt` versions. Their products are blocks of 32
   reflectors, too narrow ever to pay for the copies.
@@ -218,12 +220,12 @@ The thresholds come from 2, 3, 4 and 6 threads on the test machine:
   worker can't hide the serial panels.
 - **Solves:** owner-computes won from n = 600 on every thread count.
 
-An `_mt` function ran at most 3% slower than its serial version, within noise, in these runs:
+An `_mt` function ran at most 4% slower than its serial version, within noise, in these runs:
 - every `_mt` function at n = 400, 800 and 1600 on 6 threads;
 - the LU factorization from n = 600 to 1400 on 2, 3, 4 and 6 threads;
 - `solve_matrix_mt` and `inverse_mt` from n = 400 to 1000 on 2, 3, 4 and 6 threads.
 
-The worst case was `cholesky_mt` at 0.97×. Where there is enough work to share, the `_mt`
+The worst case was `solve_mt` at 0.96× at n = 800. Where there is enough work to share, the `_mt`
 functions are faster.
 
 On a CPU with performance and efficiency cores, set the thread count to the number of performance
@@ -241,7 +243,7 @@ race.
 | Memory | 32 GB DDR5-6200 (2 × 16 GB Corsair Vengeance, CMK32GX5M2B6200C36) |
 | Board | ASUS ROG STRIX Z690-I GAMING WIFI |
 | OS | Windows 11 Home 23H2 (build 22631), High performance power plan |
-| Goose | v2026.3, compiled by clang-cl 22.1.3 (Visual Studio 2026) with `/O2 /arch:AVX2`. A plain `goose build`, where `simd` picks the AVX2 kernels at run time, measured within 2% (6% for `cholesky`). |
+| Goose | v2026.3, compiled by clang-cl 22.1.3 (Visual Studio 2026) with `/O2 /arch:AVX2`. A plain `goose build`, where `simd` picks the AVX2 kernels at run time, measured within 3% at n = 400 and 6% at smaller sizes. |
 | Reference | NumPy 2.2.6 on Python 3.12.0, linked to OpenBLAS 0.3.29 (`DYNAMIC_ARCH`, which picks AVX2/FMA kernels on this CPU) |
 | Pinning | Single-threaded runs on logical CPU 4, a performance core. Multithreaded runs use 6 threads pinned to logical CPUs 0, 2, 4, 6, 8 and 10, one per performance core. Unpinned, or on all 16 logical CPUs, OpenBLAS's LU ran more than 100× slower than on one thread. |
 
@@ -256,16 +258,16 @@ absolute times at n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
-| Goose | 2.5 ms | 1.27 ms | 3.7 ms | 1.0 ms | 5.5 ms | 11.9 ms | 24.6 ms |
-| OpenBLAS | 2.0 ms | 1.28 ms | 4.4 ms | 1.1 ms | 6.1 ms | 11.3 ms | 22.3 ms |
-| ratio | 1.23× | 0.99× | 0.82× | 0.93× | 0.89× | 1.05× | 1.10× |
+| Goose | 2.5 ms | 1.26 ms | 3.6 ms | 0.78 ms | 5.4 ms | 12.0 ms | 24.5 ms |
+| OpenBLAS | 2.1 ms | 1.30 ms | 4.4 ms | 1.10 ms | 6.1 ms | 11.1 ms | 21.7 ms |
+| ratio | 1.22× | 0.97× | 0.83× | 0.71× | 0.88× | 1.08× | 1.13× |
 
 At n = 400:
 - `solve`, `det` and `matvec` match OpenBLAS, and `inverse`, `cholesky` and `qr` beat it.
 - `matmul` runs at 51 GFLOP/s against OpenBLAS's 62. It is the furthest behind, at 1.2–1.4× at
   every size, because Goose's C never uses FMA (see Building for speed).
-- The middle sizes are the next gap: at n = 100–200, `solve` and `det` are 1.15× behind, and
-  `cholesky` 1.16× at n = 200 (it is ahead at n = 100).
+- The middle sizes are the next gap: at n = 200, `solve`, `det` and `cholesky` are 1.15–1.17×
+  behind. At n = 100, `solve` and `det` are 1.05× behind and `cholesky` is ahead.
 
 At n = 50, almost everything is faster than NumPy, whose call overhead dominates there.
 
@@ -296,24 +298,21 @@ Times at n = 1600, and the speedups on 6 threads over 1:
 
 | n = 1600 | matmul | det | solve | solve_matrix | inverse | cholesky |
 |---|---|---|---|---|---|---|
-| Goose, 1 thread | 183 ms | 68 ms | 70 ms | 256 ms | 221 ms | 46 ms |
-| Goose, 6 threads | 68 ms | 45 ms | 45 ms | 121 ms | 119 ms | 46 ms |
-| speedup | **2.7×** | 1.5× | 1.5× | **2.1×** | **1.9×** | 1.0× |
-| OpenBLAS, 1 thread | 120 ms | 53 ms | 54 ms | 197 ms | 193 ms | 40 ms |
-| OpenBLAS, 6 threads | 24 ms | 18 ms | 54 ms | 60 ms | 57 ms | 26 ms |
+| Goose, 1 thread | 171 ms | 68 ms | 68 ms | 248 ms | 216 ms | 39 ms |
+| Goose, 6 threads | 67 ms | 46 ms | 46 ms | 118 ms | 117 ms | 39 ms |
+| speedup | **2.6×** | 1.5× | 1.5× | **2.1×** | **1.8×** | 1.0× |
+| OpenBLAS, 1 thread | 119 ms | 53 ms | 53 ms | 197 ms | 194 ms | 40 ms |
+| OpenBLAS, 6 threads | 23 ms | 18 ms | 53 ms | 60 ms | 57 ms | 26 ms |
 | speedup | 5.1× | 2.9× | 1.0× | 3.3× | 3.4× | 1.5× |
 
-On one thread Goose is 1.15–1.5× behind OpenBLAS at this size, more than at n = 400, where the
-matrices fit in cache. On six it is 1.7–2.9× behind, because OpenBLAS's threads share the matrix
-in memory while Goose's copy what they work on. The exception is `solve`, where Goose is 16%
-ahead: OpenBLAS doesn't speed it up on more threads at this size.
+On one thread Goose is 1.1–1.45× behind OpenBLAS at this size, more than at n = 400, where the
+matrices fit in cache; `cholesky` is level. On six it is 1.5–2.9× behind, because OpenBLAS's
+threads share the matrix in memory while Goose's copy what they work on. The exception is
+`solve`, where Goose takes 14% less time: OpenBLAS doesn't speed it up on more threads at this
+size.
 
-At n = 800, `matmul` gains 1.8×, `solve_matrix` 1.31× and `inverse` 1.25×. The rest run at
+At n = 800, `matmul` gains 1.8×, `solve_matrix` 1.23× and `inverse` 1.16×. The rest run at
 serial speed.
-
-One run of OpenBLAS on six threads stalled despite the pinning (its `det` took 332 ms at
-n = 1600 instead of 18), as unpinned runs do. Two repeats were normal, and the table uses the
-second.
 
 ### Reproducing
 

@@ -1025,8 +1025,24 @@ fn cholesky_update<G>(l: matrix&, k0: i64, k1: i64, r: i64, c1: i64, strip: i64)
             G(l, s0, r, l, s0, k0, false, lt, 0, 0, n - s0, c1 - r, k1 - k0, -1.0);
             break;
         }
+        // A strip is the rectangle left of its diagonal block, through G, and
+        // the diagonal block, through gemm_acc in sub-strips of CHOL_STRIP
+        // rows that stop at their own diagonals: a tall strip, which gemm_mt
+        // needs to share, then wastes no more above the diagonal than a
+        // short one. Every call starts a multiple of four rows from r.
         let s1 = min(s0 + strip, n);
-        G(l, s0, r, l, s0, k0, false, lt, 0, 0, s1 - s0, min(s1, c1) - r, k1 - k0, -1.0);
+        if strip <= CHOL_STRIP {
+            G(l, s0, r, l, s0, k0, false, lt, 0, 0, s1 - s0, min(s1, c1) - r, k1 - k0, -1.0);
+            s0 = s1;
+            continue;
+        }
+        if s0 > r { G(l, s0, r, l, s0, k0, false, lt, 0, 0, s1 - s0, s0 - r, k1 - k0, -1.0); }
+        var t0 = s0;
+        while t0 < s1 {
+            let t1 = min(t0 + CHOL_STRIP, s1);
+            gemm_acc(l, t0, s0, l, t0, k0, false, lt, 0, s0 - r, t1 - t0, min(t1, c1) - s0, k1 - k0, -1.0);
+            t0 = t1;
+        }
         s0 = s1;
     }
 }
