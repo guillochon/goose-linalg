@@ -1,6 +1,6 @@
 // linalg.parallel: multithreaded versions of linalg's heavy operations.
 //
-//   import linalg from "guillochon/goose-linalg@v0.3.1";
+//   import linalg from "guillochon/goose-linalg@v0.3.2";
 //   import linalg.parallel;
 //
 //   linalg::set_threads(6);              // optional; hardware_threads() by default

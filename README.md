@@ -5,7 +5,7 @@ build step, nothing to install. An optional module, `linalg.parallel`, runs the 
 several threads.
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.3.1";   // or from "../goose-linalg" for a local checkout
+import linalg from "guillochon/goose-linalg@v0.3.2";   // or from "../goose-linalg" for a local checkout
 
 fn main() {
     let a = linalg::from_rows(3, 3, [4, 1, 2, 1, 3, 0, 2, 0, 5]);
@@ -62,7 +62,8 @@ first, until `goose fetch --update`.
 - `lu_factor` uses partial pivoting, blocked twice as LAPACK's `getrf`. Within an outer block of
   256 columns it factors 32-column panels, each updating the rest of the outer block with one
   matrix multiply; then the outer block updates the whole trailing matrix, 256 deep. Each panel is
-  factored in a column-major copy, so its divisions and updates run down long contiguous columns.
+  factored in a column-major copy, so its work runs down long contiguous columns: each column
+  takes the updates of the columns before it four at a time, then a vectorized pivot search.
   Up to 64 columns it runs unblocked. `det`, `solve`, `solve_matrix` and `inverse` are built on it. The
   triangular solves behind `solve_matrix` and `inverse` are blocked the same two ways. `inverse`
   also skips the zeros of L⁻¹, so it costs about 2n³ flops rather than 2⅔n³.
@@ -118,7 +119,7 @@ targets baseline x86-64 (SSE2).
 
 - **Under clang:** `linalg`'s hot kernels are `simd fn`s. Goose builds each for baseline x86-64
   and again for AVX2 and AVX-512, and picks the widest the CPU has at run time. A plain
-  `goose build` therefore ran within 3% of a build with AVX2 at n = 400 and 6% at smaller sizes, and
+  `goose build` therefore ran within 2% of a build with AVX2 at n = 400 and 9% at smaller sizes, and
   the matrix multiply ran at twice the speed it gets without `simd`.
 - **Under MSVC:** `simd` does nothing (Goose builds one version), so enable AVX2 yourself before
   building:
@@ -136,8 +137,8 @@ targets baseline x86-64 (SSE2).
   multiply-adds, and `/fp:contract` or `-ffp-contract=fast` change nothing.
 
 Don't use `/fp:fast` or `-ffast-math`. Under clang they do bring FMA back. The disassembly
-showed 2,124 vector FMA instructions against none, and the matrix multiply took 26% less time at
-n = 400, at 68 GFLOP/s, ahead of OpenBLAS's 62. But they break IEEE semantics: under `/fp:fast`, MSVC folds `1.0 / 0.0` to
+showed 2,124 vector FMA instructions against none, and the matrix multiply took 24% less time at
+n = 400, at 67 GFLOP/s, ahead of OpenBLAS's 63. But they break IEEE semantics: under `/fp:fast`, MSVC folds `1.0 / 0.0` to
 `1e300`, and checks for NaN and infinity stop working. One check in the test suite fails under
 it. It also ends `linalg.parallel`'s bit-for-bit match with the serial results: fast-math lets
 the compiler build the worker threads' copy of the kernel with a different summation order.
@@ -145,7 +146,7 @@ the compiler build the worker threads' copy of the kernel with a different summa
 ## Multithreading
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.3.1";
+import linalg from "guillochon/goose-linalg@v0.3.2";
 import linalg.parallel;
 
 fn main() {
@@ -243,7 +244,7 @@ race.
 | Memory | 32 GB DDR5-6200 (2 × 16 GB Corsair Vengeance, CMK32GX5M2B6200C36) |
 | Board | ASUS ROG STRIX Z690-I GAMING WIFI |
 | OS | Windows 11 Home 23H2 (build 22631), High performance power plan |
-| Goose | v2026.3, compiled by clang-cl 22.1.3 (Visual Studio 2026) with `/O2 /arch:AVX2`. A plain `goose build`, where `simd` picks the AVX2 kernels at run time, measured within 3% at n = 400 and 6% at smaller sizes. |
+| Goose | v2026.3, compiled by clang-cl 22.1.3 (Visual Studio 2026) with `/O2 /arch:AVX2`. A plain `goose build`, where `simd` picks the AVX2 kernels at run time, measured within 2% at n = 400 and 9% at smaller sizes. |
 | Reference | NumPy 2.2.6 on Python 3.12.0, linked to OpenBLAS 0.3.29 (`DYNAMIC_ARCH`, which picks AVX2/FMA kernels on this CPU) |
 | Pinning | Single-threaded runs on logical CPU 4, a performance core. Multithreaded runs use 6 threads pinned to logical CPUs 0, 2, 4, 6, 8 and 10, one per performance core. Unpinned, or on all 16 logical CPUs, OpenBLAS's LU ran more than 100× slower than on one thread. |
 
@@ -258,16 +259,16 @@ absolute times at n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
-| Goose | 2.5 ms | 1.26 ms | 3.6 ms | 0.78 ms | 5.4 ms | 12.0 ms | 24.5 ms |
-| OpenBLAS | 2.1 ms | 1.30 ms | 4.4 ms | 1.10 ms | 6.1 ms | 11.1 ms | 21.7 ms |
-| ratio | 1.22× | 0.97× | 0.83× | 0.71× | 0.88× | 1.08× | 1.13× |
+| Goose | 2.5 ms | 1.19 ms | 3.6 ms | 0.79 ms | 5.4 ms | 12.0 ms | 24.5 ms |
+| OpenBLAS | 2.0 ms | 1.24 ms | 4.3 ms | 1.08 ms | 6.0 ms | 11.0 ms | 21.7 ms |
+| ratio | 1.25× | 0.96× | 0.82× | 0.73× | 0.90× | 1.09× | 1.13× |
 
 At n = 400:
 - `solve`, `det` and `matvec` match OpenBLAS, and `inverse`, `cholesky` and `qr` beat it.
-- `matmul` runs at 51 GFLOP/s against OpenBLAS's 62. It is the furthest behind, at 1.2–1.4× at
+- `matmul` runs at 50 GFLOP/s against OpenBLAS's 63. It is the furthest behind, at 1.2–1.4× at
   every size, because Goose's C never uses FMA (see Building for speed).
-- The middle sizes are the next gap: at n = 200, `solve`, `det` and `cholesky` are 1.15–1.17×
-  behind. At n = 100, `solve` and `det` are 1.05× behind and `cholesky` is ahead.
+- The middle sizes are the next gap: at n = 200, `cholesky` is 1.18× behind, and `solve` and
+  `det` 1.05×. At n = 100 all three are ahead.
 
 At n = 50, almost everything is faster than NumPy, whose call overhead dominates there.
 
@@ -298,20 +299,20 @@ Times at n = 1600, and the speedups on 6 threads over 1:
 
 | n = 1600 | matmul | det | solve | solve_matrix | inverse | cholesky |
 |---|---|---|---|---|---|---|
-| Goose, 1 thread | 171 ms | 68 ms | 68 ms | 248 ms | 216 ms | 39 ms |
-| Goose, 6 threads | 67 ms | 46 ms | 46 ms | 118 ms | 117 ms | 39 ms |
-| speedup | **2.6×** | 1.5× | 1.5× | **2.1×** | **1.8×** | 1.0× |
-| OpenBLAS, 1 thread | 119 ms | 53 ms | 53 ms | 197 ms | 194 ms | 40 ms |
-| OpenBLAS, 6 threads | 23 ms | 18 ms | 53 ms | 60 ms | 57 ms | 26 ms |
-| speedup | 5.1× | 2.9× | 1.0× | 3.3× | 3.4× | 1.5× |
+| Goose, 1 thread | 172 ms | 67 ms | 68 ms | 244 ms | 210 ms | 38 ms |
+| Goose, 6 threads | 69 ms | 48 ms | 44 ms | 123 ms | 120 ms | 39 ms |
+| speedup | **2.5×** | 1.4× | 1.5× | **2.0×** | **1.8×** | 1.0× |
+| OpenBLAS, 1 thread | 118 ms | 53 ms | 54 ms | 197 ms | 194 ms | 41 ms |
+| OpenBLAS, 6 threads | 23 ms | 18 ms | 53 ms | 62 ms | 56 ms | 26 ms |
+| speedup | 5.1× | 2.9× | 1.0× | 3.2× | 3.4× | 1.5× |
 
 On one thread Goose is 1.1–1.45× behind OpenBLAS at this size, more than at n = 400, where the
-matrices fit in cache; `cholesky` is level. On six it is 1.5–2.9× behind, because OpenBLAS's
+matrices fit in cache; `cholesky` is 6% ahead. On six it is 1.5–3× behind, because OpenBLAS's
 threads share the matrix in memory while Goose's copy what they work on. The exception is
-`solve`, where Goose takes 14% less time: OpenBLAS doesn't speed it up on more threads at this
+`solve`, where Goose takes 17% less time: OpenBLAS doesn't speed it up on more threads at this
 size.
 
-At n = 800, `matmul` gains 1.8×, `solve_matrix` 1.23× and `inverse` 1.16×. The rest run at
+At n = 800, `matmul` gains 1.8×, `solve_matrix` 1.30× and `inverse` 1.18×. The rest run at
 serial speed.
 
 ### Reproducing
