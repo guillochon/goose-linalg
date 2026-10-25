@@ -798,6 +798,198 @@ fn test_svd() {
 // Sizes past the blocked algorithms' panel width (32): one column over a
 // block, exactly two blocks, three blocks plus a remainder, and one outer
 // block (256) plus a remainder.
+// eigh past EIGH_DC_MIN rows is divide and conquer: spectra that make it
+// deflate, rotate close pairs apart, and solve secular equations whose
+// roots crowd their poles.
+fn test_eigh_dc() {
+    group("eigh, divide and conquer");
+    fn tridiag(dg: f64[:], off: f64[:]) -> linalg::matrix {
+        let n = dg.len;
+        var a = linalg::zeros(n, n);
+        for i in n {
+            linalg::set(a, i, i, dg[i]);
+            if i > 0 {
+                linalg::set(a, i, i - 1, off[i]);
+                linalg::set(a, i - 1, i, off[i]);
+            }
+        }
+        return a;
+    }
+    fn check_eigh(a, want: f64[:], what: const u8[:]) {
+        let n = a.rows;
+        var w: f64[>..] = [];
+        var v = linalg::zeros(0, 0);
+        let ok = linalg::eigh(a, w, v);
+        // n eps |a|, with room: the worst measured was under one unit.
+        let unit = 10.0 * n * linalg::EPS * max(linalg::max_abs(a), 1.0e-300);
+        var sorted = true;
+        for i in 1..n { sorted = sorted && w[i - 1] <= w[i]; }
+        check(ok && sorted, str(what, ": converges, ascending"));
+        check(orthonormal_cols(v, 10.0 * n * linalg::EPS), str(what, ": v^T v = I"));
+        check_mat(linalg::matmul(a, v), linalg::matmul(v, linalg::diag(w)), unit, str(what, ": a v = v diag(w)"));
+        if want.len == n {
+            var ws: f64[>..] = [];
+            ws.append(want);
+            sort(ws);
+            check_vec(w, ws, unit, str(what, ": eigenvalues"));
+        }
+    }
+    let none: f64[>..] = [];
+    var g = rng { 29 };
+    // Wilkinson's W+ : pairs of eigenvalues agreeing to working precision.
+    for m in [50, 100] {
+        var dg: f64[>..] = [];
+        var off: f64[>..] = [];
+        for i in 2 * m + 1 {
+            dg.push(abs(m - i) * 1.0);
+            off.push(1.0);
+        }
+        check_eigh(tridiag(dg, off), none, str("W", 2 * m + 1, "+"));
+    }
+    // The path graph's Laplacian, known exactly.
+    {
+        let n = 200;
+        var dg: f64[>..] = [];
+        var off: f64[>..] = [];
+        var want: f64[>..] = [];
+        for i in n {
+            dg.push(2.0);
+            off.push(-1.0);
+            want.push(2.0 - 2.0 * cos((i + 1) * PI / (n + 1)));
+        }
+        check_eigh(tridiag(dg, off), want, "Laplacian n=200");
+    }
+    // Zero off-diagonals split the problem; tiny ones nearly do.
+    {
+        var dg: f64[>..] = [];
+        var off: f64[>..] = [];
+        var dg2: f64[>..] = [];
+        var off2: f64[>..] = [];
+        for i in 150 {
+            dg.push((i % 7) * 1.0);
+            off.push(if i % 13 == 0 { 0.0 } else { 0.5 });
+            dg2.push(i * 1.0);
+            off2.push(1.0e-12);
+        }
+        check_eigh(tridiag(dg, off), none, "zero off-diagonals");
+        check_eigh(tridiag(dg2, off2), none, "tiny off-diagonals");
+    }
+    var ones: f64[>..] = [];
+    for i in 100 { ones.push(1.0); }
+    check_eigh(linalg::identity(100), ones, "identity n=100");
+    // q diag(lam) q^T: clusters, a graded spectrum, rank one.
+    for spec in 4 {
+        let n = 130;
+        var lam: f64[>..] = [];
+        for i in n {
+            lam.push(if spec == 0 {
+                if i < 65 { 1.0 } else { (i - 64) * 0.37 }
+            } else if spec == 1 {
+                1.0 + i * 1.0e-12
+            } else if spec == 2 {
+                pow(10.0, -i * 15.0 / n)
+            } else {
+                if i == 0 { 1.0 } else { 0.0 }
+            });
+        }
+        var q = linalg::zeros(0, 0);
+        var r = linalg::zeros(0, 0);
+        linalg::qr(linalg::random(n, n, g), q, r);
+        let a = linalg::matmul(linalg::matmul(q, linalg::diag(lam)), linalg::transpose(q));
+        let names = ["65 equal eigenvalues", "all within 2e-10", "graded 1 to 1e-15", "rank one"];
+        check_eigh(linalg::scale(linalg::add(a, linalg::transpose(a)), 0.5), lam, names[spec]);
+    }
+    // Far from 1 in scale both ways.
+    let s = random_symmetric(120, g);
+    check_eigh(linalg::scale(s, 1.0e150), none, "scaled by 1e150");
+    check_eigh(linalg::scale(s, 1.0e-150), none, "scaled by 1e-150");
+    // Either side of the switch from QL.
+    for n in [linalg::EIGH_DC_MIN, linalg::EIGH_DC_MIN + 1] {
+        check_eigh(random_symmetric(n, g), none, str("random n=", n));
+    }
+}
+
+// svd past SVD_DC_MIN columns is divide and conquer on the bidiagonal:
+// spectra that deflate, crowd, or reach zero, both shapes, and a matrix
+// large enough for the blocked bidiagonalization.
+fn test_svd_dc() {
+    group("svd, divide and conquer");
+    fn check_svd(a, want: f64[:], what: const u8[:]) {
+        let m = a.rows;
+        let n = a.cols;
+        let k = min(m, n);
+        var u = linalg::zeros(0, 0);
+        var s: f64[>..] = [];
+        var v = linalg::zeros(0, 0);
+        let ok = linalg::svd(a, u, s, v);
+        // n eps |a|, with room: the worst measured was under three units.
+        let nn = max(m, n);
+        let unit = 10.0 * nn * linalg::EPS * max(linalg::max_abs(a), 1.0e-300);
+        var ordered = true;
+        for i in k { ordered = ordered && s[i] >= 0.0 && (i == 0 || s[i - 1] >= s[i]); }
+        check(ok && ordered, str(what, ": converges, descending, non-negative"));
+        check(orthonormal_cols(u, 10.0 * nn * linalg::EPS), str(what, ": u^T u = I"));
+        check(orthonormal_cols(v, 10.0 * nn * linalg::EPS), str(what, ": v^T v = I"));
+        check_mat(linalg::matmul(linalg::matmul(u, linalg::diag(s)), linalg::transpose(v)), a, unit, str(what, ": u s v^T = a"));
+        if want.len == k {
+            var ws: f64[>..] = [];
+            ws.append(want);
+            sort(ws) { x, y => x > y };
+            check_vec(s, ws, unit, str(what, ": singular values"));
+        }
+    }
+    fn orthogonal(n: i64, g: rng&) -> linalg::matrix {
+        var q = linalg::zeros(0, 0);
+        var r = linalg::zeros(0, 0);
+        linalg::qr(linalg::random(n, n, g), q, r);
+        return q;
+    }
+    let none: f64[>..] = [];
+    var g = rng { 31 };
+    for spec in 5 {
+        let n = 110;
+        var sig: f64[>..] = [];
+        for i in n {
+            sig.push(if spec == 0 {
+                if i < 55 { 1.0 } else { 0.0 }
+            } else if spec == 1 {
+                if i < 55 { 2.0 } else { (i - 54) * 0.01 }
+            } else if spec == 2 {
+                pow(10.0, -i * 15.0 / n)
+            } else if spec == 3 {
+                if i == 0 { 1.0 } else { 0.0 }
+            } else {
+                (i / 10) * 1.0
+            });
+        }
+        let a = linalg::matmul(linalg::matmul(orthogonal(n, g), linalg::diag(sig)), linalg::transpose(orthogonal(n, g)));
+        let names = ["rank 55", "55 equal", "graded 1 to 1e-15", "rank one", "11 clusters of 10, one at 0"];
+        check_svd(a, sig, names[spec]);
+    }
+    // Zeros straight on the bidiagonal.
+    {
+        let n = 120;
+        var b = linalg::zeros(n, n);
+        for i in n {
+            linalg::set(b, i, i, if i % 9 == 0 { 0.0 } else { 1.0 + i * 0.01 });
+            if i + 1 < n { linalg::set(b, i, i + 1, if i % 11 == 0 { 0.0 } else { 0.5 }); }
+        }
+        check_svd(b, none, "bidiagonal with zeros");
+    }
+    check_svd(linalg::zeros(90, 70), none, "zero matrix");
+    check_svd(linalg::random(200, 90, g), none, "tall 200x90");
+    check_svd(linalg::random(80, 170, g), none, "wide 80x170");
+    let r = linalg::random(100, 90, g);
+    check_svd(linalg::scale(r, 1.0e150), none, "scaled by 1e150");
+    check_svd(linalg::scale(r, 1.0e-150), none, "scaled by 1e-150");
+    // Past BRD_BLOCKED_MIN entries: the blocked bidiagonalization.
+    check_svd(linalg::random(420, 390, g), none, "420x390, blocked reduction");
+    // Either side of the switch from QR.
+    for n in [linalg::SVD_DC_MIN, linalg::SVD_DC_MIN + 1] {
+        check_svd(linalg::random(n + 3, n, g), none, str("random ", n + 3, "x", n));
+    }
+}
+
 fn test_blocked() {
     group("blocked sizes");
     var g = rng { 23 };
@@ -910,6 +1102,8 @@ fn main() {
     test_qr();
     test_eigh();
     test_svd();
+    test_eigh_dc();
+    test_svd_dc();
     test_blocked();
     test_composition();
     var note: u8[>..] = [];

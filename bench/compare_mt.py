@@ -58,7 +58,7 @@ ax[1].set(yscale="log", ylabel="ms (log)", title=f"Absolute time at n = {n}")
 ax[1].set_xticks(range(len(ops)), ops, rotation=30)
 ax[1].legend(fontsize=8)
 fig.suptitle(f"linalg.parallel vs OpenBLAS 0.3.29, {p} threads pinned to one logical CPU per P-core, i5-12600K, "
-             "MSVC /O2 /arch:AVX2 /fp:contract", fontsize=10)
+             "clang-cl 22 /O2 /arch:AVX2", fontsize=10)
 fig.tight_layout()
 fig.savefig("compare_mt.png", dpi=120)
 print("wrote compare_mt.png")

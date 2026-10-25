@@ -245,7 +245,7 @@ let NC = 512;
 // of b loaded feeds four rows of c, and each pass over a row of c folds in
 // four rows of b. The entries of a are scalars here, so a transposed a
 // costs nothing extra.
-fn gemm_block(c: matrix&, ci: i64, cj: i64, a, ai: i64, aj: i64, trans_a: bool,
+simd fn gemm_block(c: matrix&, ci: i64, cj: i64, a, ai: i64, aj: i64, trans_a: bool,
               b, bi: i64, bj: i64, m: i64, n: i64, k: i64, alpha: f64) {
     assert(m >= 0 && n >= 0 && k >= 0);
     assert(ci + m <= c.rows && cj + n <= c.cols && bi + k <= b.rows && bj + n <= b.cols);
@@ -367,7 +367,7 @@ fn power(a, k: i64) -> matrix {
 // written; a single running sum it may not reorder without fast-math.
 let LANES = 16;
 
-fn dot(x: f64[:], y: f64[:]) -> f64 {
+simd fn dot(x: f64[:], y: f64[:]) -> f64 {
     let n = x.len;
     assert(y.len == n);
     // Short vectors don't fill the lanes: setting them up and adding them
@@ -390,6 +390,29 @@ fn dot(x: f64[:], y: f64[:]) -> f64 {
     var s = 0.0;
     for k in LANES { s += acc[k]; }
     for j in m..n { s += x[j] * y[j]; }
+    return s;
+}
+
+// The sum of x, through the lanes dot uses.
+simd fn lane_sum(x: f64[:]) -> f64 {
+    let n = x.len;
+    if n < 2 * LANES {
+        var s = 0.0;
+        for v in x { s += v; }
+        return s;
+    }
+    var acc: f64[LANES] = [0.0; LANES];
+    let m = n - n % LANES;
+    var i = 0;
+    while i < m {
+        let xs = x[i..i + LANES];
+        assert(xs.len == LANES);
+        for k in LANES { acc[k] += xs[k]; }
+        i += LANES;
+    }
+    var s = 0.0;
+    for k in LANES { s += acc[k]; }
+    for j in m..n { s += x[j]; }
     return s;
 }
 
@@ -436,7 +459,7 @@ fn vscale(x: f64[:], s: f64) -> f64[>..] {
 }
 
 // y += alpha * x, in place.
-fn axpy(alpha: f64, x: f64[:], y: f64[:]) {
+simd fn axpy(alpha: f64, x: f64[:], y: f64[:]) {
     assert(x.len == y.len);
     for v, i in x { y[i] += alpha * v; }
 }
@@ -573,7 +596,7 @@ fn lu_factor_with<G>(a: matrix&, piv: i64[>..]&) -> f64, bool {
 // Swaps each row k in k0..k1 of c with row swaps[k - k0], over columns
 // c0..c1, in order: what the row swaps of a panel do to columns it doesn't
 // hold.
-fn lu_swap_rows(c: matrix&, c0: i64, c1: i64, swaps: i64[:], k0: i64, k1: i64) {
+simd fn lu_swap_rows(c: matrix&, c0: i64, c1: i64, swaps: i64[:], k0: i64, k1: i64) {
     let ld = c.cols;
     for k in k0..k1 {
         let p = swaps[k - k0];
@@ -596,7 +619,7 @@ fn lu_swap_rows(c: matrix&, c0: i64, c1: i64, swaps: i64[:], k0: i64, k1: i64) {
 // leaves in `swaps` the row swapped with each row o0..o1 (itself when none
 // was). The swaps reach columns 0..o1 of a only: the caller applies them to
 // the columns from o1 on (lu_swap_rows) before lu_outer_update.
-fn lu_outer_panel(a: matrix&, piv: i64[>..]&, o0: i64, o1: i64, nb: i64, swaps: i64[>..]&) -> f64, bool {
+simd fn lu_outer_panel(a: matrix&, piv: i64[>..]&, o0: i64, o1: i64, nb: i64, swaps: i64[>..]&) -> f64, bool {
     let n = a.rows;
     var sign = 1.0;
     var ok = true;
@@ -1102,7 +1125,7 @@ fn form_from_reflectors(q: matrix&, vs: matrix&, tau: f64[:], off: i64, tt: matr
 // wb = T wb, or T^T wb with trans, in place, for the kb x kb upper
 // triangular T in rows k0..k0 + kb of tt. Rows are combined in the order
 // that reads each source row before it is overwritten.
-fn apply_t(wb: matrix&, tt: matrix&, k0: i64, kb: i64, trans: bool) {
+simd fn apply_t(wb: matrix&, tt: matrix&, k0: i64, kb: i64, trans: bool) {
     fn t(i: i64, l: i64) -> f64 { tt.data[(k0 + i) * tt.cols + l] }
     if trans {
         // Row i of T^T wb is the sum over l <= i of T[l][i] wb[l]: bottom up.
@@ -1152,7 +1175,7 @@ fn lstsq(a, b: f64[:]) -> f64[>..], bool {
 // Symmetric eigenproblem
 
 // Swaps rows p and q of m.
-fn swap_rows(m: matrix&, p: i64, q: i64) {
+simd fn swap_rows(m: matrix&, p: i64, q: i64) {
     let rp = row(m, p);
     let rq = row(m, q);
     assert(rq.len == rp.len);
@@ -1165,9 +1188,22 @@ fn swap_rows(m: matrix&, p: i64, q: i64) {
 
 // Rows p and q of m become c p - s q and s p + c q: the rotation every
 // Jacobi step applies, along two contiguous rows.
-fn rotate_rows(m: matrix&, p: i64, q: i64, c: f64, s: f64) {
+simd fn rotate_rows(m: matrix&, p: i64, q: i64, c: f64, s: f64) {
     let rp = row(m, p);
     let rq = row(m, q);
+    assert(rq.len == rp.len);
+    for k in rp.len {
+        let x = rp[k];
+        let y = rq[k];
+        rp[k] = c * x - s * y;
+        rq[k] = s * x + c * y;
+    }
+}
+
+// rotate_rows over columns c0..c1 only.
+simd fn rotate_rows_in(m: matrix&, p: i64, q: i64, c: f64, s: f64, c0: i64, c1: i64) {
+    let rp = row(m, p)[c0..c1];
+    let rq = row(m, q)[c0..c1];
     assert(rq.len == rp.len);
     for k in rp.len {
         let x = rp[k];
@@ -1187,15 +1223,615 @@ fn hypot2(a: f64, b: f64) -> f64 {
     return big * sqrt(1.0 + small * small);
 }
 
+// ---------------------------------------------------------------------------
+// The symmetric tridiagonal eigenproblem by divide and conquer
+//
+// Cuppen's method as LAPACK's dstedc has it: tear the tridiagonal in two at
+// an off-diagonal entry beta, T = diag(T1, T2) + |beta| v v^T, solve the
+// halves, and get the whole from the eigensystem of D + rho z z^T, a
+// diagonal plus a rank-one update. Its eigenvalues are the roots of the
+// secular equation 1/rho + sum z_j^2 / (d_j - lambda) = 0, one between each
+// pair of poles; its eigenvectors, as Gu and Eisenstat compute them, stay
+// orthogonal to working precision however close the roots fall. The
+// halves' eigenvectors combine with them in one gemm_acc product per merge,
+// where the QL method would spend some 6n^3 flops on plane rotations.
+
+// Blocks this small are solved by QL.
+let DC_LEAF = 25;
+
+// eigh uses divide and conquer past this many rows, QL up to it: the two
+// broke even between 60 and 75 rows, and divide and conquer took 10% off
+// at 100 and 16% at 150.
+let EIGH_DC_MIN = 64;
+
+// The eigensystem of the symmetric tridiagonal with diagonal d and
+// off-diagonal e (e[i] joins i and i + 1; e[n - 1] is ignored): d becomes
+// the eigenvalues, unsorted, and row j of z the eigenvector of d[j]. e is
+// overwritten. Returns false if a QL leaf or a secular equation failed to
+// converge.
+fn tridiag_dc(d: f64[:], e: f64[:], z: matrix&) -> bool {
+    let n = d.len;
+    assert(e.len == n);
+    z = zeros(n, n);
+    guard n > 0 else { return true; }
+    // Scaled to a largest entry of 1, so nothing below over- or underflows.
+    var scale = 0.0;
+    for i in n { scale = max(scale, abs(d[i])); }
+    for i in n - 1 { scale = max(scale, abs(e[i])); }
+    if scale == 0.0 {
+        for i in n { z.data[i * n + i] = 1.0; }
+        return true;
+    }
+    for i in n { d[i] /= scale; }
+    for i in n - 1 { e[i] /= scale; }
+    e[n - 1] = 0.0;
+
+    // Halve every block until all are leaves: bounds holds their starts,
+    // then n.
+    var bounds: i64[>..] = [0, n];
+    loop {
+        var big = 0;
+        for b in bounds.len - 1 { big = max(big, bounds[b + 1] - bounds[b]); }
+        guard big > DC_LEAF else { break; }
+        var next: i64[>..] = [];
+        for b in bounds.len - 1 {
+            next.push(bounds[b]);
+            next.push(bounds[b] + (bounds[b + 1] - bounds[b]) / 2);
+        }
+        next.push(n);
+        bounds = copy(next);
+    }
+    // Tear at every boundary m: diag(T1, T2) + |beta| v v^T with
+    // v = e_(m-1) + sign(beta) e_m.
+    for b in 1..bounds.len - 1 {
+        let m = bounds[b];
+        let beta = abs(e[m - 1]);
+        d[m - 1] -= beta;
+        d[m] -= beta;
+    }
+    var ok = true;
+    var el: f64[>..] = [];
+    for b in bounds.len - 1 {
+        let lo = bounds[b];
+        let hi = bounds[b + 1];
+        for i in lo..hi { z.data[i * n + i] = 1.0; }
+        el.clear();
+        el.append(e[lo..hi]);
+        el[hi - lo - 1] = 0.0;
+        if !tql_block(d[lo..hi], el, z, lo, lo, hi) { ok = false; }
+    }
+    // Merge neighboring blocks, a level at a time.
+    while bounds.len > 2 {
+        var next: i64[>..] = [];
+        var b = 0;
+        while b + 2 < bounds.len {
+            next.push(bounds[b]);
+            if !dc_merge(d, e[bounds[b + 1] - 1], z, bounds[b], bounds[b + 1], bounds[b + 2]) { ok = false; }
+            b += 2;
+        }
+        if b + 1 < bounds.len - 1 { next.push(bounds[b]); }
+        next.push(n);
+        bounds = copy(next);
+    }
+    for i in n { d[i] *= scale; }
+    return ok;
+}
+
+// Merges the solved blocks lo..m and m..hi, torn apart at beta: rows lo..hi
+// of z (columns lo..hi) and d[lo..hi] become the eigensystem of the block
+// lo..hi.
+fn dc_merge(d: f64[:], beta: f64, z: matrix&, lo: i64, m: i64, hi: i64) -> bool {
+    let n = z.cols;
+    let nn = hi - lo;
+    let sgn = if beta < 0.0 { -1.0 } else { 1.0 };
+    // In the eigenvectors of the halves, v = e_(m-1) + sign(beta) e_m is the
+    // last component of each of the first half and the first of each of the
+    // second. |v| is sqrt(2): halved here, doubled into rho.
+    let rho = 2.0 * abs(beta);
+    let r2 = 1.0 / sqrt(2.0);
+    // The block's vectors in order of their eigenvalues: rows[r] of z,
+    // with eigenvalue ds[r] and z component zs[r].
+    var rows: i64[>..] = [];
+    for j in lo..hi { rows.push(j); }
+    sort(rows) { a, b => d[a] < d[b] };
+    var ds: f64[>..] = [];
+    var zs: f64[>..] = [];
+    // Where each vector is nonzero: 1 in the first half's columns only, 3
+    // in the second's, 2 both, once deflation has rotated it with the other
+    // half's.
+    var kind: i64[>..] = [];
+    for j in rows {
+        kind.push(if j < m { 1 } else { 3 });
+        ds.push(d[j]);
+        zs.push(r2 * (if j < m { z.data[j * n + m - 1] } else { sgn * z.data[j * n + m] }));
+    }
+    var dmax = 0.0;
+    var zmax = 0.0;
+    for r in nn {
+        dmax = max(dmax, abs(ds[r]));
+        zmax = max(zmax, abs(zs[r]));
+    }
+    let tol = 8.0 * EPS * max(dmax, zmax);
+    if rho * zmax <= tol { return true; }
+
+    // Deflation, as dlaed2: a negligible z component leaves its pair as it
+    // is, and two eigenvalues close enough are rotated so one of their z
+    // components is zero.
+    var keep: i64[>..] = [];        // positions r solved for
+    var pj = -1;
+    for r in nn {
+        if rho * abs(zs[r]) <= tol { continue; }
+        if pj < 0 {
+            pj = r;
+            continue;
+        }
+        let tau = hypot2(zs[r], zs[pj]);
+        let c = zs[r] / tau;
+        let s = -zs[pj] / tau;
+        let t = ds[r] - ds[pj];
+        if abs(t * c * s) <= tol {
+            zs[r] = tau;
+            zs[pj] = 0.0;
+            rotate_rows_in(z, rows[pj], rows[r], c, -s, lo, hi);
+            if kind[pj] != kind[r] { kind[r] = 2; }
+            let dp = ds[pj] * c * c + ds[r] * s * s;
+            ds[r] = ds[pj] * s * s + ds[r] * c * c;
+            ds[pj] = dp;
+        } else {
+            keep.push(pj);
+        }
+        pj = r;
+    }
+    if pj >= 0 { keep.push(pj); }
+    // Deflated pairs keep their vectors, with their eigenvalues.
+    for r in nn { d[rows[r]] = ds[r]; }
+    let k = keep.len;
+    guard k > 0 else { return true; }
+
+    var dk: f64[>..] = [];
+    var zk: f64[>..] = [];
+    for r in keep {
+        dk.push(ds[r]);
+        zk.push(zs[r]);
+    }
+    // del[i * k + j] = dk[j] - lambda_i.
+    var lam: f64[>..] = [];
+    lam.resize(k, 0.0);
+    var del: f64[>..] = [];
+    del.resize(k * k, 0.0);
+    var ok = true;
+    for i in k { if !secular_root(dk, zk, rho, i, lam, del, false) { ok = false; } }
+    // Gu and Eisenstat: the z for which the computed roots are exact,
+    // zh_j^2 = -(dk_j - lambda_j) prod_(i != j) (dk_j - lambda_i) / (dk_j - dk_i),
+    // a root at a time across every j.
+    var w: f64[>..] = [];
+    w.resize(k, 1.0);
+    var den: f64[>..] = [];
+    den.resize(k, 0.0);
+    assert(dk.len == k && w.len == k && den.len == k);
+    for i in k {
+        let di = del[i * k..(i + 1) * k];
+        assert(di.len == k);
+        for j in k { den[j] = dk[j] - dk[i]; }
+        den[i] = 1.0;
+        for j in k { w[j] *= di[j] / den[j]; }
+    }
+    var zh: f64[>..] = [];
+    for j in k {
+        let a = sqrt(max(-w[j], 0.0));
+        zh.push(if zk[j] < 0.0 { -a } else { a });
+    }
+    assert(zh.len == k);
+    // u[i][j]: component j of eigenvector i of D + rho z z^T.
+    var u = zeros(k, k);
+    for i in k {
+        let ui = row(u, i);
+        let di = del[i * k..(i + 1) * k];
+        assert(ui.len == k && di.len == k);
+        for j in k { ui[j] = zh[j] / di[j]; }
+        let inv = 1.0 / sqrt(dot(ui, ui));
+        for &x in ui { x *= inv; }
+    }
+    // The block's new vectors: u^T times the kept rows of z, those nonzero
+    // in the first half's columns, then in both, then in the second's, so
+    // each half's columns come from one product over the rows that have
+    // any there (dlaed3's split).
+    var order: i64[>..] = [];
+    for want in [1, 2, 3] { for j in k { if kind[keep[j]] == want { order.push(j); } } }
+    var n12 = 0;
+    var n23 = 0;
+    for j in k {
+        if kind[keep[j]] != 3 { n12++; }
+        if kind[keep[j]] != 1 { n23++; }
+    }
+    var vk = zeros(k, nn);
+    for j, t in order {
+        let src = row(z, rows[keep[j]])[lo..hi];
+        let dst = row(vk, t);
+        assert(src.len == nn && dst.len == nn);
+        for c in nn { dst[c] = src[c]; }
+    }
+    // The columns of u in the same order.
+    var up = zeros(k, k);
+    for i in k {
+        let ui = row(u, i);
+        let pi = row(up, i);
+        assert(ui.len == k && pi.len == k);
+        for j, t in order { pi[t] = ui[j]; }
+    }
+    let ntop = m - lo;
+    var nv = zeros(k, nn);
+    gemm_acc(nv, 0, 0, up, 0, 0, false, vk, 0, 0, k, ntop, n12, 1.0);
+    gemm_acc(nv, 0, ntop, up, 0, k - n23, false, vk, k - n23, ntop, k, nn - ntop, n23, 1.0);
+    for i in k {
+        let dst = row(z, rows[keep[i]])[lo..hi];
+        let src = row(nv, i);
+        assert(dst.len == nn && src.len == nn);
+        for c in nn { dst[c] = src[c]; }
+        d[rows[keep[i]]] = lam[i];
+    }
+    return ok;
+}
+
+// Root i of 1/rho + sum_j z_j^2 / (d_j - lambda) = 0, for d ascending, z
+// of norm 1 with no zero entry, and rho > 0: into lam[i], with
+// del[i * k + j] = d_j - lambda_i for every j, each computed from the pole
+// nearer the root so it keeps its relative accuracy. Root i lies between
+// d_i and d_(i+1), the last between d_(k-1) and d_(k-1) + rho. Each step
+// solves a model with the two neighboring poles, the nearer one's weight
+// exact (dlaed4's fixed-weight method), safeguarded by bisection.
+simd fn secular_root(dk: f64[:], zk: f64[:], rho: f64, i: i64, lam: f64[:], del: f64[:], sq: bool) -> bool {
+    let k = dk.len;
+    let rinv = 1.0 / rho;
+    // With sq the poles are dk's squares, and lam and del are in squares
+    // too; the poles' differences are then formed as (a - b)(a + b), so they
+    // keep their relative accuracy however close the poles.
+    fn pd(a: i64, b: i64) -> f64 { if sq { (dk[a] - dk[b]) * (dk[a] + dk[b]) } else { dk[a] - dk[b] } }
+    if k == 1 {
+        lam[0] = (if sq { dk[0] * dk[0] } else { dk[0] }) + rho * zk[0] * zk[0];
+        del[0] = -rho * zk[0] * zk[0];
+        return true;
+    }
+    let dl = del[i * k..(i + 1) * k];
+    assert(dl.len == k);
+    // The origin o, the nearer pole, and the bracket lo < tau < hi around
+    // the root lambda = dk[o] + tau; p1 < p2 are the poles the model uses.
+    var o = i;
+    var lo = 0.0;
+    var hi = rho;
+    var p1 = k - 2;
+    var p2 = k - 1;
+    if i < k - 1 {
+        p1 = i;
+        p2 = i + 1;
+        let mid = pd(i + 1, i) / 2.0;
+        var f = rinv;
+        for j in k { f += zk[j] * zk[j] / (pd(j, i) - mid); }
+        if f >= 0.0 {
+            hi = mid;
+        } else {
+            o = i + 1;
+            lo = -mid;
+            hi = 0.0;
+        }
+    }
+    var diff: f64[>..] = [];
+    for j in k { diff.push(pd(j, o)); }
+    var t: f64[>..] = [];
+    t.resize(k, 0.0);
+    var zt: f64[>..] = [];
+    zt.resize(k, 0.0);
+    assert(diff.len == k && zk.len == k);
+    var tau = (lo + hi) / 2.0;
+    var ok = false;
+    for iter in 100 {
+        // Separate passes, each vectorized: the sums go through lanes.
+        for j in k {
+            t[j] = zk[j] / (diff[j] - tau);
+            zt[j] = zk[j] * t[j];
+        }
+        let w = rinv + lane_sum(zt);
+        let dw = dot(t, t);
+        for &x in zt { x = abs(x); }
+        let err = lane_sum(zt);
+        if abs(w) <= EPS * (8.0 * err + 2.0 * rinv + abs(tau) * dw) {
+            ok = true;
+            break;
+        }
+        // f increases with lambda: a positive f puts the root to the left.
+        if w > 0.0 { hi = tau; } else { lo = tau; }
+        if hi - lo <= 2.0 * EPS * max(abs(lo), abs(hi)) {
+            ok = true;
+            break;
+        }
+        let a1 = diff[p1] - tau;
+        let a2 = diff[p2] - tau;
+        let c = if o == p1 {
+            w - a2 * dw - pd(p1, p2) * (zk[p1] / a1) * (zk[p1] / a1)
+        } else {
+            w - a1 * dw - pd(p2, p1) * (zk[p2] / a2) * (zk[p2] / a2)
+        };
+        let aa = (a1 + a2) * w - a1 * a2 * dw;
+        let bb = a1 * a2 * w;
+        // c eta^2 - aa eta + bb = 0: of its roots, the smallest step that
+        // stays inside the bracket.
+        var eta = 0.0;
+        var found = false;
+        if c == 0.0 {
+            if aa != 0.0 {
+                eta = bb / aa;
+                found = tau + eta > lo && tau + eta < hi;
+            }
+        } else {
+            let disc = sqrt(abs(aa * aa - 4.0 * bb * c));
+            let q = if aa >= 0.0 { (aa + disc) / 2.0 } else { (aa - disc) / 2.0 };
+            for root in 2 {
+                let x = if root == 0 { q / c } else { if q != 0.0 { bb / q } else { 0.0 } };
+                let inside = tau + x > lo && tau + x < hi;
+                if inside && (!found || abs(x) < abs(eta)) {
+                    eta = x;
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            eta = -w / dw;
+            if !(tau + eta > lo && tau + eta < hi) { eta = (lo + hi) / 2.0 - tau; }
+        }
+        tau += eta;
+    }
+    lam[i] = (if sq { dk[o] * dk[o] } else { dk[o] }) + tau;
+    for j in k { dl[j] = diff[j] - tau; }
+    return ok;
+}
+
+// tql2: the implicit QL method with Wilkinson shifts on the symmetric
+// tridiagonal with diagonal d and off-diagonal e (e[i] joins i and i + 1,
+// and the last is 0), leaving its eigenvalues, unsorted, in d. Rows r0..
+// r0 + d.len of w take the rotations, over columns c0..c1: w's row r0 + j
+// becomes column j of the accumulated transformation times what it was.
+// Returns false if an eigenvalue took more than 60 iterations.
+fn tql_block(d: f64[:], e: f64[:], w: matrix&, r0: i64, c0: i64, c1: i64) -> bool {
+    let n = d.len;
+    assert(e.len == n);
+    var converged = true;
+    var f = 0.0;
+    var tst1 = 0.0;
+    for l in n {
+        // The first negligible subdiagonal element at or after l.
+        tst1 = max(tst1, abs(d[l]) + abs(e[l]));
+        var m = l;
+        while m < n {
+            if abs(e[m]) <= EPS * tst1 { break; }
+            m++;
+        }
+        // m == l: d[l] is an eigenvalue. Otherwise iterate.
+        if m > l {
+            var iter = 0;
+            loop {
+                iter++;
+                if iter > 60 { converged = false; break; }
+                // The implicit shift.
+                var g = d[l];
+                var p = (d[l + 1] - g) / (2.0 * e[l]);
+                var r = hypot2(p, 1.0);
+                if p < 0.0 { r = -r; }
+                d[l] = e[l] / (p + r);
+                d[l + 1] = e[l] * (p + r);
+                let dl1 = d[l + 1];
+                var h = g - d[l];
+                for i in l + 2..n { d[i] -= h; }
+                f += h;
+                // The implicit QL transformation.
+                p = d[m];
+                var c = 1.0;
+                var c2 = c;
+                var c3 = c;
+                let el1 = e[l + 1];
+                var s = 0.0;
+                var s2 = 0.0;
+                var i = m - 1;
+                while i >= l {
+                    c3 = c2;
+                    c2 = c;
+                    s2 = s;
+                    g = c * e[i];
+                    h = c * p;
+                    r = hypot2(p, e[i]);
+                    e[i + 1] = s * r;
+                    s = e[i] / r;
+                    c = p / r;
+                    p = c * d[i] - s * g;
+                    d[i + 1] = h + s * (c * g + s * d[i]);
+                    // Accumulate: columns i and i + 1 of V are rows of w.
+                    rotate_rows_in(w, r0 + i, r0 + i + 1, c, s, c0, c1);
+                    i--;
+                }
+                p = -s * s2 * c3 * el1 * e[l] / dl1;
+                e[l] = s * p;
+                d[l] = c * p;
+                if abs(e[l]) <= EPS * tst1 { break; }
+            }
+        }
+        d[l] += f;
+        e[l] = 0.0;
+    }
+
+    return converged;
+}
+
+// Reduces symmetric w (its lower triangle) to tridiagonal form
+// T = Q^T w Q: d its diagonal, e[i] the entry joining i and i + 1 (e[n - 1]
+// = 0). Q = H_0 H_1 ... H_n-2 with H_j = I - tau[j] v_j v_j^T, v_j column j
+// of vs, zero above row j + 1 where it is 1. w is overwritten.
+//
+// Blocked as LAPACK's dsytrd and dlatrd: a panel of NB columns is reduced
+// one reflector at a time against the matrix as it stood before the panel,
+// corrected on the fly by the panel's V and W, and the rest of the matrix
+// then takes the whole panel at once, w -= V W^T + W V^T, as gemm_acc
+// products on its lower triangle. Each reflector still needs one product of
+// the remaining matrix with its vector, half the work: it reads each row of
+// the lower triangle once, for both of the entries it stands for.
+simd fn tridiagonalize(w: matrix&, d: f64[:], e: f64[:], vs: matrix&, tau: f64[:]) {
+    let n = w.rows;
+    let nr = n - 1;
+    assert(n >= 2 && d.len == n && e.len == n && vs.rows == n && vs.cols == nr && tau.len == nr);
+    // Row t of vt and wt: the panel's reflector t and its w, zero before
+    // the reflector's first row.
+    var vt = zeros(NB, n);
+    var wt = zeros(NB, n);
+    var x: f64[>..] = [];
+    x.resize(n, 0.0);
+    var i0 = 0;
+    while i0 < nr {
+        let i1 = min(i0 + NB, nr);
+        for j in i0..i1 {
+            let jj = j - i0;
+            // Column j of the matrix as the panel has left it, from row j.
+            let xr = x[j..n];
+            assert(xr.len == n - j);
+            for c in n - j { xr[c] = w.data[(j + c) * n + j]; }
+            for t in jj {
+                axpy(-wt.data[t * n + j], row(vt, t)[j..n], xr);
+                axpy(-vt.data[t * n + j], row(wt, t)[j..n], xr);
+            }
+            d[j] = x[j];
+            // The reflector taking x[j + 1..] to beta e_1 (dlarfg).
+            let alpha = x[j + 1];
+            let xnorm = vnorm(x[j + 2..n]);
+            var tj = 0.0;
+            var beta = alpha;
+            if xnorm != 0.0 {
+                beta = hypot2(alpha, xnorm);
+                if alpha >= 0.0 { beta = -beta; }
+                tj = (beta - alpha) / beta;
+                let sc = 1.0 / (alpha - beta);
+                for r in j + 2..n { x[r] *= sc; }
+            }
+            x[j + 1] = 1.0;
+            e[j] = beta;
+            tau[j] = tj;
+            let vr = row(vt, jj);
+            let wr = row(wt, jj);
+            for c in n {
+                vr[c] = if c > j { x[c] } else { 0.0 };
+                wr[c] = 0.0;
+            }
+            for r in j + 1..n { vs.data[r * nr + j] = x[r]; }
+            if tj == 0.0 { continue; }
+            // w = tau A v for the matrix as the panel has left it, then
+            // w -= (tau / 2) (w^T v) v.
+            let v = x[j + 1..n];
+            let y = wr[j + 1..n];
+            // Row r of the lower triangle, columns j + 1..=r, is both row r
+            // and column r of the matrix there.
+            for r in j + 1..n {
+                let wr2 = row(w, r)[j + 1..r + 1];
+                let k = r - j;
+                y[k - 1] += dot(wr2, v[..k]);
+                axpy(x[r], wr2[..k - 1], y[..k - 1]);
+            }
+            for t in jj {
+                let pv = dot(row(wt, t)[j + 1..n], v);
+                let qv = dot(row(vt, t)[j + 1..n], v);
+                axpy(-pv, row(vt, t)[j + 1..n], y);
+                axpy(-qv, row(wt, t)[j + 1..n], y);
+            }
+            for &c in y { c *= tj; }
+            axpy(-0.5 * tj * dot(y, v), v, y);
+        }
+        // The rest of the matrix takes the panel, w -= V W^T + W V^T, on
+        // its lower triangle: NB rows at a time, up to their diagonal.
+        var r0 = i1;
+        while r0 < n {
+            let r1 = min(r0 + NB, n);
+            gemm_acc(w, r0, i1, vt, 0, r0, true, wt, 0, i1, r1 - r0, r1 - i1, i1 - i0, -1.0);
+            gemm_acc(w, r0, i1, wt, 0, r0, true, vt, 0, i1, r1 - r0, r1 - i1, i1 - i0, -1.0);
+            r0 = r1;
+        }
+        i0 = i1;
+    }
+    d[n - 1] = w.data[(n - 1) * n + n - 1];
+    e[n - 1] = 0.0;
+}
+
+// q = H_0 H_1 ... H_kmax-1 q, all of q's columns, for the reflectors of
+// vs (reflector k zero above row k + off) with each block's T in tt.
+// form_from_reflectors without the identity's shortcuts.
+fn apply_reflectors(q: matrix&, vs: matrix&, off: i64, tt: matrix&) {
+    let m = q.rows;
+    let nc = q.cols;
+    let kmax = vs.cols;
+    var blocks = (kmax + NB - 1) / NB;
+    while blocks > 0 {
+        blocks--;
+        let b0 = blocks * NB;
+        let kb = min(b0 + NB, kmax) - b0;
+        let r0 = b0 + off;
+        if r0 >= m { continue; }
+        var wb = zeros(kb, nc);
+        gemm_acc(wb, 0, 0, vs, r0, b0, true, q, r0, 0, kb, nc, m - r0, 1.0);
+        apply_t(wb, tt, b0, kb, false);
+        gemm_acc(q, r0, 0, vs, r0, b0, false, wb, 0, 0, m - r0, nc, kb, -1.0);
+    }
+}
+
+// eigh past EIGH_DC_MIN rows: tridiagonalize, divide and conquer, then
+// the reflectors applied to the tridiagonal's eigenvectors.
+fn eigh_dc(a, values: f64[>..]&, vectors: matrix&) -> bool {
+    let n = a.rows;
+    // The lower triangle, from the upper one.
+    var w = zeros(n, n);
+    for i in n { for j in i..n { w.data[j * n + i] = a.data[i * n + j]; } }
+    var d: f64[>..] = [];
+    d.resize(n, 0.0);
+    var e: f64[>..] = [];
+    e.resize(n, 0.0);
+    var vs = zeros(n, n - 1);
+    var tau: f64[>..] = [];
+    tau.resize(n - 1, 0.0);
+    tridiagonalize(w, d, e, vs, tau);
+    var z = zeros(0, 0);
+    let converged = tridiag_dc(d, e, z);
+    // The eigenvectors of a are q times those of the tridiagonal, which
+    // are z's rows.
+    var x = transpose(z);
+    var tt = zeros(n - 1, NB);
+    var k0 = 0;
+    while k0 < n - 1 {
+        householder_t(vs, tau, k0, min(k0 + NB, n - 1), 1, tt);
+        k0 += NB;
+    }
+    apply_reflectors(x, vs, 1, tt);
+    // Ascending, moving the vectors with their values.
+    var order: i64[>..] = [];
+    for i in n { order.push(i); }
+    sort(order) { p, q => d[p] < d[q] };
+    values.clear();
+    for i in order { values.push(d[i]); }
+    vectors = zeros(n, n);
+    for r in n {
+        let src = row(x, r);
+        let dst = row(vectors, r);
+        assert(src.len == n && dst.len == n);
+        for c, i in order { dst[i] = src[c]; }
+    }
+    return converged;
+}
+
 // Eigenvalues and eigenvectors of symmetric a: a = vectors diag(values)
 // vectors^T with values ascending and vectors orthogonal, column j belonging
-// to values[j]. Reads the upper triangle of a. Returns false if the QL
+// to values[j]. Reads the upper triangle of a. Returns false if an
 // iteration did not converge.
 //
-// Householder reduction to tridiagonal form, then the implicit QL method
-// with Wilkinson shifts: EISPACK's tred2 and tql2, by way of JAMA. Both
-// classically walk the columns of the working matrix; here it is kept
-// transposed, w[c][r] for their V[r][c], so the walks run along rows.
+// Past EIGH_DC_MIN rows, as LAPACK's dsyevd: the blocked reduction to
+// tridiagonal form (tridiagonalize), divide and conquer on the
+// tridiagonal (tridiag_dc), and the reduction's reflectors applied to its
+// eigenvectors (eigh_dc). Up to there, Householder reduction to tridiagonal
+// form, then the implicit QL method with Wilkinson shifts: EISPACK's tred2
+// and tql2, by way of JAMA. Both classically walk the columns of the
+// working matrix; here it is kept transposed, w[c][r] for their V[r][c],
+// so the walks run along rows.
 fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
     assert(a.rows == a.cols);
     let n = a.rows;
@@ -1204,6 +1840,7 @@ fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
         vectors = zeros(0, 0);
         return true;
     }
+    if n > EIGH_DC_MIN { return eigh_dc(a, values, vectors); }
     var w = clone(a);
     var e: f64[>..] = [];
     e.resize(n, 0.0);
@@ -1301,68 +1938,7 @@ fn eigh(a, values: f64[>..]&, vectors: matrix&) -> bool {
     // tql2: diagonalize the tridiagonal matrix by implicit QL steps.
     for i in 1..n { e[i - 1] = e[i]; }
     e[n - 1] = 0.0;
-    var f = 0.0;
-    var tst1 = 0.0;
-    var converged = true;
-    for l in n {
-        // The first negligible subdiagonal element at or after l.
-        tst1 = max(tst1, abs(d[l]) + abs(e[l]));
-        var m = l;
-        while m < n {
-            if abs(e[m]) <= EPS * tst1 { break; }
-            m++;
-        }
-        // m == l: d[l] is an eigenvalue. Otherwise iterate.
-        if m > l {
-            var iter = 0;
-            loop {
-                iter++;
-                if iter > 60 { converged = false; break; }
-                // The implicit shift.
-                var g = d[l];
-                var p = (d[l + 1] - g) / (2.0 * e[l]);
-                var r = hypot2(p, 1.0);
-                if p < 0.0 { r = -r; }
-                d[l] = e[l] / (p + r);
-                d[l + 1] = e[l] * (p + r);
-                let dl1 = d[l + 1];
-                var h = g - d[l];
-                for i in l + 2..n { d[i] -= h; }
-                f += h;
-                // The implicit QL transformation.
-                p = d[m];
-                var c = 1.0;
-                var c2 = c;
-                var c3 = c;
-                let el1 = e[l + 1];
-                var s = 0.0;
-                var s2 = 0.0;
-                var i = m - 1;
-                while i >= l {
-                    c3 = c2;
-                    c2 = c;
-                    s2 = s;
-                    g = c * e[i];
-                    h = c * p;
-                    r = hypot2(p, e[i]);
-                    e[i + 1] = s * r;
-                    s = e[i] / r;
-                    c = p / r;
-                    p = c * d[i] - s * g;
-                    d[i + 1] = h + s * (c * g + s * d[i]);
-                    // Accumulate: columns i and i + 1 of V are rows of w.
-                    rotate_rows(w, i, i + 1, c, s);
-                    i--;
-                }
-                p = -s * s2 * c3 * el1 * e[l] / dl1;
-                e[l] = s * p;
-                d[l] = c * p;
-                if abs(e[l]) <= EPS * tst1 { break; }
-            }
-        }
-        d[l] += f;
-        e[l] = 0.0;
-    }
+    let converged = tql_block(d, e, w, 0, 0, n);
 
     // Ascending, moving the vectors with their values.
     for i in n {
@@ -1398,26 +1974,544 @@ fn svd(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     return svd_tall(transpose(a), v, s, u);     // a^T = v diag(s) u^T
 }
 
-// svd for rows >= cols, by Golub-Kahan-Reinsch: Householder reflections
+// ---------------------------------------------------------------------------
+// The bidiagonal SVD by divide and conquer
+//
+// As LAPACK's dbdsdc: the upper bidiagonal B is split at a middle row k
+// into B1 (the rows above, one column wider than tall), the row itself
+// (alpha at column k, beta at k + 1) and B2 (the rows below). With the
+// halves' SVDs, B becomes, in their singular vectors, a diagonal plus one
+// dense row: M = diag(d) + e_k z^T, d_k = 0, where z is the middle row in
+// the halves' right singular vectors. M^T M = diag(d^2) + z z^T, so the
+// squared singular values are the roots of the secular equation
+// 1 + sum z_j^2 / (d_j^2 - sigma^2) = 0, which secular_root solves with
+// the differences of squares formed as (d_j - d_o)(d_j + d_o), keeping
+// small singular values accurate. Gu and Eisenstat's z gives right vectors
+// z_j / (d_j^2 - sigma^2) and left ones [-1, d_j z_j / (d_j^2 - sigma^2)],
+// orthogonal to working precision; the halves' vectors combine with them in
+// one gemm_acc product each per merge.
+//
+// A node of the recursion is rows r0..r1 and columns r0..r1 + sqre: square,
+// or one column wider (sqre = 1), whose extra right singular vector, its
+// null vector, sits in row r1 of vb. Singular value d[j], its left vector
+// in row j of ub and its right one in row j of vb, for j in r0..r1.
+
+// Nodes this small are solved by Golub-Kahan QR (svd_tall_qr).
+let SVD_LEAF = 25;
+
+// svd uses divide and conquer past this many columns.
+let SVD_DC_MIN = 64;
+
+// The blocked bidiagonalization pays once the matrix outgrows L2, from about
+// 400 x 400 on the test machine (1.25 MB of L2): 12% faster at 500, 34% at
+// 800. Below it the unblocked one keeps the matrix in cache and is faster.
+let BRD_BLOCKED_MIN = 160000;
+
+// The SVD of the upper bidiagonal with diagonal d and superdiagonal e
+// (e[i] joins i and i + 1; e[n - 1] is ignored): d becomes the singular
+// values, unsorted and non-negative, row j of ub the left singular vector
+// of d[j] and row j of vb the right one. e is overwritten. Returns false if
+// a leaf or a secular equation failed to converge.
+fn bidiag_dc(d: f64[:], e: f64[:], ub: matrix&, vb: matrix&) -> bool {
+    let n = d.len;
+    assert(e.len == n);
+    ub = zeros(n, n);
+    vb = zeros(n, n);
+    guard n > 0 else { return true; }
+    // Scaled to a largest entry of 1, so nothing below over- or underflows.
+    var scale = 0.0;
+    for i in n { scale = max(scale, abs(d[i])); }
+    for i in n - 1 { scale = max(scale, abs(e[i])); }
+    if scale == 0.0 {
+        for i in n {
+            ub.data[i * n + i] = 1.0;
+            vb.data[i * n + i] = 1.0;
+        }
+        return true;
+    }
+    for i in n { d[i] /= scale; }
+    for i in n - 1 { e[i] /= scale; }
+    let ok = bidiag_node(d, e, ub, vb, 0, n, 0);
+    for i in n { d[i] *= scale; }
+    return ok;
+}
+
+recursive fn bidiag_node(d: f64[:], e: f64[:], ub: matrix&, vb: matrix&, r0: i64, r1: i64, sqre: i64) -> bool {
+    let nn = r1 - r0;
+    if nn <= SVD_LEAF { return bidiag_leaf(d, e, ub, vb, r0, r1, sqre); }
+    let k = r0 + nn / 2;
+    var ok = bidiag_node(d, e, ub, vb, r0, k, 1);
+    if !bidiag_node(d, e, ub, vb, k + 1, r1, sqre) { ok = false; }
+    if !bidiag_merge(d, e, ub, vb, r0, k, r1, sqre) { ok = false; }
+    return ok;
+}
+
+// x's rows of the kept slots, columns c0..c1, combined by w (new vector i
+// is sum_j w[i][j] times kept slot j's row) into out, kk x (c1 - c0): the
+// rows nonzero before column split (kind 1 or 2) make out's columns before
+// it, those nonzero after it (kind 2 or 3) the rest.
+fn bidiag_combine(x: matrix&, out: matrix&, w: matrix&, rows: i64[:], keep: i64[:], kind: i64[:], c0: i64, c1: i64, split: i64) {
+    let kk = keep.len;
+    let wd = c1 - c0;
+    let ntop = split - c0;
+    var order: i64[>..] = [];
+    for want in [1, 2, 3] { for j in kk { if kind[keep[j]] == want { order.push(j); } } }
+    var n12 = 0;
+    var n23 = 0;
+    for j in kk {
+        if kind[keep[j]] != 3 { n12++; }
+        if kind[keep[j]] != 1 { n23++; }
+    }
+    var xk = zeros(kk, wd);
+    for j, t in order {
+        let src = row(x, rows[keep[j]])[c0..c1];
+        let dst = row(xk, t);
+        assert(src.len == wd && dst.len == wd);
+        for c in wd { dst[c] = src[c]; }
+    }
+    var wp = zeros(kk, kk);
+    for i in kk {
+        let wi = row(w, i);
+        let pi = row(wp, i);
+        assert(wi.len == kk && pi.len == kk);
+        for j, t in order { pi[t] = wi[j]; }
+    }
+    gemm_acc(out, 0, 0, wp, 0, 0, false, xk, 0, 0, kk, ntop, n12, 1.0);
+    gemm_acc(out, 0, ntop, wp, 0, kk - n23, false, xk, kk - n23, ntop, kk, wd - ntop, n23, 1.0);
+}
+
+// A leaf, by Golub-Kahan QR on the block written out dense; a wide one's
+// null vector completes its right singular vectors to a basis.
+fn bidiag_leaf(d: f64[:], e: f64[:], ub: matrix&, vb: matrix&, r0: i64, r1: i64, sqre: i64) -> bool {
+    let n = ub.cols;
+    let nn = r1 - r0;
+    let mc = nn + sqre;
+    var b = zeros(nn, mc);
+    for i in nn {
+        b.data[i * mc + i] = d[r0 + i];
+        if i + 1 < mc { b.data[i * mc + i + 1] = e[r0 + i]; }
+    }
+    var u = zeros(0, 0);
+    var s: f64[>..] = [];
+    var v = zeros(0, 0);
+    // u is nn x nn and v mc x nn, singular vectors as columns.
+    let ok = if sqre == 0 { svd_tall_qr(b, u, s, v) } else { svd_tall_qr(transpose(b), v, s, u) };
+    for j in nn {
+        d[r0 + j] = s[j];
+        for c in nn { ub.data[(r0 + j) * n + r0 + c] = u.data[c * nn + j]; }
+        for c in mc { vb.data[(r0 + j) * n + r0 + c] = v.data[c * nn + j]; }
+    }
+    if sqre == 1 {
+        // The unit vector least in v's span, less its projections onto v's
+        // columns, twice over, normalized.
+        var best = 0;
+        var least = 2.0;
+        for p in mc {
+            var inside = 0.0;
+            for j in nn { inside += v.data[p * nn + j] * v.data[p * nn + j]; }
+            if inside < least {
+                least = inside;
+                best = p;
+            }
+        }
+        var x: f64[>..] = [];
+        x.resize(mc, 0.0);
+        x[best] = 1.0;
+        for pass in 2 {
+            for j in nn {
+                var pr = 0.0;
+                for c in mc { pr += v.data[c * nn + j] * x[c]; }
+                for c in mc { x[c] -= pr * v.data[c * nn + j]; }
+            }
+        }
+        let inv = 1.0 / vnorm(x);
+        for c in mc { vb.data[r1 * n + r0 + c] = x[c] * inv; }
+    }
+    return ok;
+}
+
+// Merges the solved nodes r0..k (one column wider) and k + 1..r1 across the
+// middle row k into the node r0..r1.
+fn bidiag_merge(d: f64[:], e: f64[:], ub: matrix&, vb: matrix&, r0: i64, k: i64, r1: i64, sqre: i64) -> bool {
+    let n = ub.cols;
+    let nn = r1 - r0;
+    let c1 = r1 + sqre;
+    let alpha = d[k];
+    let beta = e[k];
+    // Slot k: the middle row's own unit vector on the left, the upper
+    // node's null vector on the right, and pole 0.
+    ub.data[k * n + k] = 1.0;
+    d[k] = 0.0;
+    // z: the middle row in the right vectors of the slots.
+    var z: f64[>..] = [];
+    for s in r0..k + 1 { z.push(alpha * vb.data[s * n + k]); }
+    for s in k + 1..r1 { z.push(beta * vb.data[s * n + k + 1]); }
+    if sqre == 1 {
+        // The lower node's null vector, row r1, rotated into slot k's so the
+        // middle row has nothing left past the square: what remains in row
+        // r1 is the merged node's null vector.
+        let zn = beta * vb.data[r1 * n + k + 1];
+        let zm = z[k - r0];
+        let r = hypot2(zm, zn);
+        if r != 0.0 {
+            rotate_rows_in(vb, k, r1, zm / r, -zn / r, r0, c1);
+            z[k - r0] = r;
+        }
+    }
+    // The slots by pole, slot k first.
+    var rows: i64[>..] = [];
+    for j in r0..r1 { rows.push(j); }
+    sort(rows) { a, b => d[a] < d[b] || (d[a] == d[b] && a == k && b != k) };
+    var ds: f64[>..] = [];
+    var zs: f64[>..] = [];
+    // Where each slot's vectors are nonzero, as in dc_merge: 1 before the
+    // halves' boundary only, 3 after it, 2 both. On the left slot k is the
+    // middle row's unit vector, before it; on the right the upper node's
+    // null vector, mixed with the lower one's when it was rotated in.
+    var ku: i64[>..] = [];
+    var kv: i64[>..] = [];
+    for j in rows {
+        ds.push(d[j]);
+        zs.push(z[j - r0]);
+        ku.push(if j <= k { 1 } else { 3 });
+        kv.push(if j < k { 1 } else if j == k { if sqre == 1 { 2 } else { 1 } } else { 3 });
+    }
+    var dmax = 0.0;
+    for x in ds { dmax = max(dmax, x); }
+    let tol = 8.0 * EPS * max(dmax, max(abs(alpha), abs(beta)));
+    // Deflation, as dlasd2. Slot k always stays, with |z| at least tol; a
+    // negligible z elsewhere leaves its slot as it is; two poles within tol
+    // are rotated, on both sides, so one of their z is zero.
+    if abs(zs[0]) <= tol { zs[0] = tol; }
+    var keep: i64[>..] = [0];
+    var pj = -1;
+    for r in 1..nn {
+        if abs(zs[r]) <= tol { continue; }
+        if pj < 0 {
+            pj = r;
+            continue;
+        }
+        if abs(ds[r] - ds[pj]) <= tol {
+            let tau = hypot2(zs[r], zs[pj]);
+            let c = zs[r] / tau;
+            let s = -zs[pj] / tau;
+            zs[r] = tau;
+            zs[pj] = 0.0;
+            rotate_rows_in(ub, rows[pj], rows[r], c, -s, r0, r1);
+            rotate_rows_in(vb, rows[pj], rows[r], c, -s, r0, c1);
+            if ku[pj] != ku[r] { ku[r] = 2; }
+            if kv[pj] != kv[r] { kv[r] = 2; }
+        } else {
+            keep.push(pj);
+        }
+        pj = r;
+    }
+    if pj >= 0 { keep.push(pj); }
+    for r in nn { d[rows[r]] = ds[r]; }
+    let kk = keep.len;
+    var dk: f64[>..] = [];
+    var zk: f64[>..] = [];
+    for r in keep {
+        dk.push(ds[r]);
+        zk.push(zs[r]);
+    }
+    // The first pole past 0 at least tol / 2 from it.
+    if kk > 1 && dk[1] < tol / 2.0 { dk[1] = tol / 2.0; }
+    let znorm = vnorm(zk);
+    var zn: f64[>..] = [];
+    for x in zk { zn.push(x / znorm); }
+    // lam[i] = sigma_i^2; del[i * kk + j] = dk[j]^2 - sigma_i^2.
+    var lam: f64[>..] = [];
+    lam.resize(kk, 0.0);
+    var del: f64[>..] = [];
+    del.resize(kk * kk, 0.0);
+    var ok = true;
+    for i in kk { if !secular_root(dk, zn, znorm * znorm, i, lam, del, true) { ok = false; } }
+    // Gu and Eisenstat, in squares.
+    var w: f64[>..] = [];
+    w.resize(kk, 1.0);
+    var den: f64[>..] = [];
+    den.resize(kk, 0.0);
+    assert(dk.len == kk && w.len == kk && den.len == kk);
+    for i in kk {
+        let di = del[i * kk..(i + 1) * kk];
+        assert(di.len == kk);
+        for j in kk { den[j] = (dk[j] - dk[i]) * (dk[j] + dk[i]); }
+        den[i] = 1.0;
+        for j in kk { w[j] *= di[j] / den[j]; }
+    }
+    var zh: f64[>..] = [];
+    for j in kk {
+        let a = sqrt(max(-w[j], 0.0));
+        zh.push(if zk[j] < 0.0 { -a } else { a });
+    }
+    assert(zh.len == kk);
+    // Right vectors vm[i][j] = zh_j / (dk_j^2 - sigma_i^2), left ones
+    // um[i] = [-1, dk_j zh_j / (dk_j^2 - sigma_i^2)], each normalized.
+    var vm = zeros(kk, kk);
+    var um = zeros(kk, kk);
+    for i in kk {
+        let vi = row(vm, i);
+        let ui = row(um, i);
+        let di = del[i * kk..(i + 1) * kk];
+        assert(vi.len == kk && ui.len == kk && di.len == kk);
+        for j in kk { vi[j] = zh[j] / di[j]; }
+        for j in kk { ui[j] = dk[j] * vi[j]; }
+        ui[0] = -1.0;
+        let iv = 1.0 / sqrt(dot(vi, vi));
+        for &x in vi { x *= iv; }
+        let iu = 1.0 / sqrt(dot(ui, ui));
+        for &x in ui { x *= iu; }
+    }
+    // The node's new vectors, from the kept slots': u^T, or v^T, times
+    // their rows, each side in two products split at the halves' boundary
+    // over the rows that have anything on each side of it (dlasd3's split).
+    let wu = r1 - r0;
+    let wv = c1 - r0;
+    var nu = zeros(kk, wu);
+    var nv = zeros(kk, wv);
+    bidiag_combine(ub, nu, um, rows, keep, ku, r0, r1, k + 1);
+    bidiag_combine(vb, nv, vm, rows, keep, kv, r0, c1, k + 1);
+    for i in kk {
+        let r = rows[keep[i]];
+        let du = row(ub, r)[r0..r1];
+        let su = row(nu, i);
+        let dv = row(vb, r)[r0..c1];
+        let sv = row(nv, i);
+        assert(du.len == wu && su.len == wu && dv.len == wv && sv.len == wv);
+        for c in wu { du[c] = su[c]; }
+        for c in wv { dv[c] = sv[c]; }
+        d[r] = sqrt(lam[i]);
+    }
+    return ok;
+}
+
+// svd_tall_qr: svd for rows >= cols, by Golub-Kahan-Reinsch: Householder reflections
 // reduce a to bidiagonal form, then implicit-shift QR steps diagonalize the
 // bidiagonal. This is LINPACK's dsvdc by way of JAMA. The classical
 // algorithm walks the columns of a, u and v; here all three are kept
 // transposed, so every walk is along a row.
+// svd for rows >= cols. Past SVD_DC_MIN columns, as LAPACK's dgesdd: the
+// reduction to bidiagonal form (svd_reduce), divide and conquer on the
+// bidiagonal (bidiag_dc), and the reduction's u and v times its singular
+// vectors. Up to there, svd_tall_qr.
 fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
-    assert(a.rows >= a.cols);
     let m = a.rows;
     let n = a.cols;
-    s.clear();
-    guard n > 0 else {
-        u = zeros(m, 0);
-        v = zeros(0, 0);
-        return true;
-    }
-    var at = transpose(a);      // row j is column j of a
-    var ut = zeros(n, m);       // row j is column j of u
-    var vt = zeros(n, n);       // row j is column j of v
-    s.resize(n, 0.0);
+    if n <= SVD_DC_MIN { return svd_tall_qr(a, u, s, v); }
     var e: f64[>..] = [];
+    var vsu = zeros(0, 0);
+    var tauu: f64[>..] = [];
+    var ttu = zeros(0, 0);
+    var vsv = zeros(0, 0);
+    var tauv: f64[>..] = [];
+    var ttv = zeros(0, 0);
+    if m * n >= BRD_BLOCKED_MIN {
+        bidiagonalize(a, s, e, vsu, tauu, ttu, vsv, tauv, ttv);
+    } else {
+        svd_reduce(a, s, e, vsu, tauu, ttu, vsv, tauv, ttv);
+    }
+    var ub = zeros(0, 0);
+    var vb = zeros(0, 0);
+    let converged = bidiag_dc(s, e, ub, vb);
+    // a = (U ub^T) diag(s) (V vb^T)^T: the reduction's reflectors applied
+    // to the bidiagonal's singular vectors, which are ub's and vb's rows.
+    var uf = zeros(m, n);
+    for r in n { for c in n { uf.data[r * n + c] = ub.data[c * n + r]; } }
+    apply_reflectors(uf, vsu, 0, ttu);
+    var vf = transpose(vb);
+    apply_reflectors(vf, vsv, 1, ttv);
+    // Descending, the vectors with their values.
+    var order: i64[>..] = [];
+    for i in n { order.push(i); }
+    sort(order) { p, q => s[p] > s[q] };
+    var sv: f64[>..] = [];
+    for i in order { sv.push(s[i]); }
+    s.clear();
+    s.append(sv);
+    u = zeros(m, n);
+    v = zeros(n, n);
+    for r in m {
+        let src = row(uf, r);
+        let dst = row(u, r);
+        assert(src.len == n && dst.len == n);
+        for c, j in order { dst[j] = src[c]; }
+    }
+    for r in n {
+        let src = row(vf, r);
+        let dst = row(v, r);
+        assert(src.len == n && dst.len == n);
+        for c, j in order { dst[j] = src[c]; }
+    }
+    return converged;
+}
+
+// The reflector of dlarfg taking x = [alpha, rest] to [beta, 0]: rest is
+// overwritten by the reflector's vector past its leading 1, and the
+// return is beta and tau, H = I - tau v v^T (tau = 0 when rest is zero).
+fn householder_vec(alpha: f64, rest: f64[:]) -> f64, f64 {
+    let xnorm = vnorm(rest);
+    guard xnorm != 0.0 else { return alpha, 0.0; }
+    var beta = hypot2(alpha, xnorm);
+    if alpha >= 0.0 { beta = -beta; }
+    let sc = 1.0 / (alpha - beta);
+    for &x in rest { x *= sc; }
+    return beta, (beta - alpha) / beta;
+}
+
+// svd_reduce for divide and conquer, blocked as LAPACK's dgebrd and dlabrd:
+// a panel of NB columns and rows is reduced one pair of reflectors at a
+// time against the matrix as it stood before the panel, corrected on the
+// fly by the panel's left vectors V and right vectors U and their partners
+// X and Y, and the rest of the matrix then takes the panel at once,
+// w -= V Y^T + X U^T, as two gemm_acc products. Each pair of reflectors
+// still needs one product of the remaining matrix with each of its vectors,
+// half the work. The reflectors come out in svd_reduce's form, LAPACK's
+// (each vector's leading entry 1).
+simd fn bidiagonalize(a, s: f64[>..]&, e: f64[>..]&, vsu: matrix&, tauu: f64[>..]&, ttu: matrix&,
+                      vsv: matrix&, tauv: f64[>..]&, ttv: matrix&) {
+    let m = a.rows;
+    let n = a.cols;
+    assert(m >= n && n >= 2);
+    var w = clone(a);
+    s.clear();
+    s.resize(n, 0.0);
+    e.clear();
+    e.resize(n, 0.0);
+    tauu.clear();
+    tauu.resize(n, 0.0);
+    tauv.clear();
+    tauv.resize(n - 1, 0.0);
+    // Row t of xt and yt: column t of the panel's X (length m) and Y
+    // (length n), zero where not yet set.
+    var xt = zeros(NB, m);
+    var yt = zeros(NB, n);
+    var col: f64[>..] = [];
+    var tmp: f64[NB] = [0.0; NB];
+    var tmp2: f64[NB] = [0.0; NB];
+    var p = 0;
+    while p < n {
+        let nb = min(NB, n - p);
+        for &x in xt.data { x = 0.0; }
+        for &x in yt.data { x = 0.0; }
+        for i in nb {
+            let ii = p + i;
+            // Column ii as the panel has left it, rows ii..m: less V times
+            // row ii of Y, and X times column ii of U.
+            col.clear();
+            for r in ii..m { col.push(w.data[r * n + ii]); }
+            for t in i {
+                tmp[t] = yt.data[t * n + ii];
+                axpy(-w.data[(p + t) * n + ii], row(xt, t)[ii..m], col);
+            }
+            for r in ii..m { col[r - ii] -= dot(row(w, r)[p..p + i], tmp[..i]); }
+            // The left reflector of column ii.
+            let beta, tq = householder_vec(col[0], col[1..]);
+            for r in ii + 1..m { w.data[r * n + ii] = col[r - ii]; }
+            s[ii] = beta;
+            tauu[ii] = tq;
+            w.data[ii * n + ii] = 1.0;
+            if ii + 1 < n {
+                // Y[ii + 1.., i] = tq (A^T v - Y V^T v - U^T X^T v), for the
+                // matrix as it stood before the panel: v is column ii of w
+                // from row ii.
+                let yi = row(yt, i)[ii + 1..n];
+                for r in ii..m {
+                    let vr = w.data[r * n + ii];
+                    if vr != 0.0 { axpy(vr, row(w, r)[ii + 1..n], yi); }
+                }
+                for t in i {
+                    var vv = 0.0;
+                    var xv = 0.0;
+                    for r in ii..m {
+                        let vr = w.data[r * n + ii];
+                        vv += w.data[r * n + p + t] * vr;
+                        xv += xt.data[t * m + r] * vr;
+                    }
+                    tmp[t] = vv;
+                    tmp2[t] = xv;
+                }
+                for t in i {
+                    axpy(-tmp[t], row(yt, t)[ii + 1..n], yi);
+                    axpy(-tmp2[t], row(w, p + t)[ii + 1..n], yi);
+                }
+                for &x in yi { x *= tq; }
+                // Row ii as the panel has left it, columns ii + 1..n.
+                let wi = row(w, ii)[ii + 1..n];
+                for t in i + 1 { axpy(-w.data[ii * n + p + t], row(yt, t)[ii + 1..n], wi); }
+                for t in i { axpy(-xt.data[t * m + ii], row(w, p + t)[ii + 1..n], wi); }
+                // The right reflector of row ii.
+                let beta2, tp = householder_vec(wi[0], wi[1..]);
+                e[ii] = beta2;
+                tauv[ii] = tp;
+                wi[0] = 1.0;
+                // X[ii + 1.., i] = tp (A u - V Y^T u - X U u), u being row ii
+                // of w from column ii + 1.
+                let u = wi;
+                let xi = row(xt, i)[ii + 1..m];
+                for r in ii + 1..m { xi[r - ii - 1] = dot(row(w, r)[ii + 1..n], u); }
+                for t in i + 1 { tmp[t] = dot(row(yt, t)[ii + 1..n], u); }
+                for t in i { tmp2[t] = dot(row(w, p + t)[ii + 1..n], u); }
+                for r in ii + 1..m {
+                    let wr = row(w, r);
+                    var x = xi[r - ii - 1];
+                    for t in i + 1 { x -= wr[p + t] * tmp[t]; }
+                    xi[r - ii - 1] = x;
+                }
+                for t in i { axpy(-tmp2[t], row(xt, t)[ii + 1..m], xi); }
+                for &x in xi { x *= tp; }
+            }
+        }
+        // The rest takes the panel: w -= V Y^T + X U^T.
+        let q = p + nb;
+        if q < n {
+            gemm_acc(w, q, q, w, q, p, false, yt, 0, q, m - q, n - q, nb, -1.0);
+            gemm_acc(w, q, q, xt, 0, q, true, w, p, q, m - q, n - q, nb, -1.0);
+        }
+        p = q;
+    }
+    // The reflectors, columns of vsu and vsv.
+    vsu = zeros(m, n);
+    for j in n {
+        vsu.data[j * n + j] = 1.0;
+        for r in j + 1..m { vsu.data[r * n + j] = w.data[r * n + j]; }
+    }
+    let nr = n - 1;
+    vsv = zeros(n, nr);
+    for j in nr {
+        vsv.data[(j + 1) * nr + j] = 1.0;
+        for c in j + 2..n { vsv.data[c * nr + j] = w.data[j * n + c]; }
+    }
+    ttu = zeros(n, NB);
+    var k0 = 0;
+    while k0 < n {
+        householder_t(vsu, tauu, k0, min(k0 + NB, n), 0, ttu);
+        k0 += NB;
+    }
+    ttv = zeros(nr, NB);
+    k0 = 0;
+    while k0 < nr {
+        householder_t(vsv, tauv, k0, min(k0 + NB, nr), 1, ttv);
+        k0 += NB;
+    }
+}
+
+// The reduction of svd_tall: a = U B V^T with B upper bidiagonal, its
+// diagonal in s and superdiagonal in e (e[n - 1] = 0). U is the product of
+// the reflectors of vsu and tauu (reflector k zero above row k), V of
+// those of vsv and tauv (zero above row k + 1), each block's T in ttu and
+// ttv. Householder reflections, LINPACK's dsvdc by way of JAMA, on
+// transposed storage.
+fn svd_reduce(a, s: f64[>..]&, e: f64[>..]&, vsu: matrix&, tauu: f64[>..]&, ttu: matrix&,
+              vsv: matrix&, tauv: f64[>..]&, ttv: matrix&) {
+    assert(a.rows >= a.cols && a.cols > 0);
+    let m = a.rows;
+    let n = a.cols;
+    var at = transpose(a);      // row j is column j of a
+    var ut = zeros(n, m);       // row k: reflector k of u
+    var vt = zeros(n, n);       // row k: reflector k of v
+    s.resize(n, 0.0);
+    e.clear();
     e.resize(n, 0.0);
     var work: f64[>..] = [];
     work.resize(m, 0.0);
@@ -1478,53 +2572,71 @@ fn svd_tall(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
     if nrt + 1 < p { e[nrt] = at.data[(p - 1) * m + nrt]; }
     e[p - 1] = 0.0;
 
-    // Generate u and v from their reflectors, blocked as qr's q. Reflector
-    // k of u is H_k = I - u_k u_k^T / u_k[k], u_k row k of ut from column k
-    // on, where s[k] != 0; v's is G_k = I - v_k v_k^T / v_k[k + 1], v_k row k
-    // of vt from column k + 1 on, where k < nrt and e[k] != 0.
-    {
-        var vs = zeros(m, nct);
-        var tau: f64[>..] = [];
-        tau.resize(nct, 0.0);
-        for k in nct {
-            let uk = row(ut, k);
-            assert(uk.len == m);
-            if s[k] == 0.0 { continue; }
-            tau[k] = 1.0 / uk[k];
-            for i in k..m { vs.data[i * nct + k] = uk[i]; }
-        }
-        var tt = zeros(nct, NB);
-        var k0 = 0;
-        while k0 < nct {
-            householder_t(vs, tau, k0, min(k0 + NB, nct), 0, tt);
-            k0 += NB;
-        }
-        var um = zeros(m, n);
-        for i in n { um.data[i * n + i] = 1.0; }
-        form_from_reflectors(um, vs, tau, 0, tt);
-        ut = transpose(um);
+    // The reflectors, for blocked application. Reflector k of u is
+    // H_k = I - u_k u_k^T / u_k[k], u_k row k of ut from column k on, where
+    // s[k] != 0; v's is G_k = I - v_k v_k^T / v_k[k + 1], v_k row k of vt
+    // from column k + 1 on, where k < nrt and e[k] != 0.
+    vsu = zeros(m, nct);
+    tauu.clear();
+    tauu.resize(nct, 0.0);
+    for k in nct {
+        let uk = row(ut, k);
+        assert(uk.len == m);
+        if s[k] == 0.0 { continue; }
+        tauu[k] = 1.0 / uk[k];
+        for i in k..m { vsu.data[i * nct + k] = uk[i]; }
     }
-    {
-        var vs = zeros(n, nrt);
-        var tau: f64[>..] = [];
-        tau.resize(nrt, 0.0);
-        for k in nrt {
-            let vk = row(vt, k);
-            assert(vk.len == n);
-            if e[k] == 0.0 { continue; }
-            tau[k] = 1.0 / vk[k + 1];
-            for i in k + 1..n { vs.data[i * nrt + k] = vk[i]; }
-        }
-        var tt = zeros(nrt, NB);
-        var k0 = 0;
-        while k0 < nrt {
-            householder_t(vs, tau, k0, min(k0 + NB, nrt), 1, tt);
-            k0 += NB;
-        }
-        var vm = identity(n);
-        form_from_reflectors(vm, vs, tau, 1, tt);
-        vt = transpose(vm);
+    ttu = zeros(nct, NB);
+    var k0 = 0;
+    while k0 < nct {
+        householder_t(vsu, tauu, k0, min(k0 + NB, nct), 0, ttu);
+        k0 += NB;
     }
+    vsv = zeros(n, nrt);
+    tauv.clear();
+    tauv.resize(nrt, 0.0);
+    for k in nrt {
+        let vk = row(vt, k);
+        assert(vk.len == n);
+        if e[k] == 0.0 { continue; }
+        tauv[k] = 1.0 / vk[k + 1];
+        for i in k + 1..n { vsv.data[i * nrt + k] = vk[i]; }
+    }
+    ttv = zeros(nrt, NB);
+    k0 = 0;
+    while k0 < nrt {
+        householder_t(vsv, tauv, k0, min(k0 + NB, nrt), 1, ttv);
+        k0 += NB;
+    }
+}
+
+fn svd_tall_qr(a, u: matrix&, s: f64[>..]&, v: matrix&) -> bool {
+    assert(a.rows >= a.cols);
+    let m = a.rows;
+    let n = a.cols;
+    s.clear();
+    guard n > 0 else {
+        u = zeros(m, 0);
+        v = zeros(0, 0);
+        return true;
+    }
+    var e: f64[>..] = [];
+    var vsu = zeros(0, 0);
+    var tauu: f64[>..] = [];
+    var ttu = zeros(0, 0);
+    var vsv = zeros(0, 0);
+    var tauv: f64[>..] = [];
+    var ttv = zeros(0, 0);
+    svd_reduce(a, s, e, vsu, tauu, ttu, vsv, tauv, ttv);
+    // u and v from their reflectors, blocked as qr's q, as rows.
+    var um = zeros(m, n);
+    for i in n { um.data[i * n + i] = 1.0; }
+    form_from_reflectors(um, vsu, tauu, 0, ttu);
+    var ut = transpose(um);
+    var vm = identity(n);
+    form_from_reflectors(vm, vsv, tauv, 1, ttv);
+    var vt = transpose(vm);
+    var p = n;
 
     // Diagonalize the bidiagonal. Rotations of columns j and q of u or v
     // are rotations of rows of ut or vt: x' = c x + s y, y' = -s x + c y

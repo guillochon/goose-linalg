@@ -5,7 +5,7 @@ build step, nothing to install. An optional module, `linalg.parallel`, runs the 
 several threads.
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.2.2";   // or from "../goose-linalg" for a local checkout
+import linalg from "guillochon/goose-linalg@v0.3.0";   // or from "../goose-linalg" for a local checkout
 
 fn main() {
     let a = linalg::from_rows(3, 3, [4, 1, 2, 1, 3, 0, 2, 0, 5]);
@@ -53,8 +53,8 @@ first, until `goose fetch --update`.
 | LU | `lu_factor(a&, piv&) -> sign, ok`, `lu_solve(lu, piv, b)`, `det`, `solve(a, b) -> x, ok`, `solve_matrix(a, b) -> x, ok`, `inverse(a) -> inv, ok` |
 | Cholesky | `cholesky(a) -> l, ok`, `cholesky_solve(l, b)` |
 | QR | `qr(a, q&, r&)` (Householder, any shape), `lstsq(a, b) -> x, ok` |
-| Symmetric eigen | `eigh(a, values&, vectors&) -> converged` (tridiagonal QL, ascending; reads the upper triangle), `eigvals_sym(a)` |
-| SVD | `svd(a, u&, s&, v&) -> converged` (thin, Golub-Kahan, descending), `singular_values`, `rank(a, tol)`, `pinv(a, tol)` |
+| Symmetric eigen | `eigh(a, values&, vectors&) -> converged` (divide and conquer past 64 rows, QL below; ascending; reads the upper triangle), `eigvals_sym(a)` |
+| SVD | `svd(a, u&, s&, v&) -> converged` (thin, divide and conquer past 64 columns, Golub-Kahan QR below; descending), `singular_values`, `rank(a, tol)`, `pinv(a, tol)` |
 | Multithreaded (`import linalg.parallel`) | `matmul_mt`, `lu_factor_mt`, `det_mt`, `solve_mt`, `solve_matrix_mt`, `inverse_mt`, `cholesky_mt`; `set_threads(n)`, `threads()`, `stop_threads()`, `parallel_jobs()` |
 
 ## Algorithms and accuracy
@@ -72,16 +72,36 @@ first, until `goose fetch --update`.
   reflectors of a panel combine into I − V·T·Vᵀ, so the rest of R, and later Q, take each block
   as two matrix multiplies. `lstsq` solves through QR and refuses rank-deficient input rather
   than returning garbage.
-- `eigh` reduces the matrix to tridiagonal form with Householder reflections, then diagonalizes it
-  with implicit QL steps and Wilkinson shifts. These are EISPACK's `tred2` and `tql2`, ported from
-  their public-domain JAMA form and run on the transposed matrix so their inner loops follow rows.
-  The eigenvector basis is built from the reflectors in compact WY blocks, like `qr`'s Q.
-- `svd` uses Golub-Kahan-Reinsch. Householder reflections reduce the matrix to bidiagonal form,
-  then implicit-shift QR steps diagonalize it. This is LINPACK's `dsvdc` by way of JAMA, and
-  LAPACK's SVD routines build on the same reduction. Like `eigh`, it works on transposed
-  storage, and builds U and V from their reflectors in compact WY blocks. Every singular value is accurate to about ε·σ_max, so a value far below σ_max is
-  only accurate in absolute terms (a one-sided Jacobi SVD would also get those right relative
-  to their own size).
+- `eigh`, past 64 rows, follows LAPACK's `dsyevd`:
+  - **Reduction:** to tridiagonal form, blocked as `dsytrd`. Within each 32-column panel the
+    reflectors are formed against the matrix as it stood before the panel; then the rest of the
+    matrix takes the panel as matrix multiplies on its lower triangle.
+  - **Divide and conquer** on the tridiagonal, as `dstedc` (Cuppen's method). Halves down to 25
+    rows are solved by QL. Each merge is a diagonal plus a rank-one update: its eigenvalues are
+    the roots of a secular equation, and its eigenvectors come from Gu and Eisenstat's formula,
+    which keeps them orthogonal however close the roots fall. They combine with the halves'
+    eigenvectors in matrix multiplies.
+  - **Back to a's basis:** the reduction's reflectors are applied to the result in compact WY
+    blocks.
+
+  Up to 64 rows, `eigh` reduces with Householder reflections and diagonalizes with implicit QL
+  steps and Wilkinson shifts. These are EISPACK's `tred2` and `tql2`, ported from their
+  public-domain JAMA form and run on the transposed matrix so their inner loops follow rows.
+- `svd`, past 64 columns, follows LAPACK's `dgesdd`:
+  - **Reduction:** to bidiagonal form. It is blocked as `dgebrd` once the matrix outgrows L2
+    (from 160,000 entries), and unblocked below that, where the unblocked one keeps the matrix
+    in cache.
+  - **Divide and conquer** on the bidiagonal, as `dbdsdc`. Each merge is a diagonal plus one
+    dense row, whose squared singular values are the roots of a secular equation. That equation
+    is solved with the differences of squares formed as (a − b)(a + b), so small singular
+    values keep their accuracy.
+  - **Back to a's basis:** the reflectors are applied in compact WY blocks.
+
+  Up to 64 columns it uses Golub-Kahan-Reinsch: Householder reflections to bidiagonal form, then
+  implicit-shift QR steps. That is LINPACK's `dsvdc` by way of JAMA, on transposed storage.
+  Either way, every singular value is accurate to a small multiple of ε·σ_max. A value far below
+  σ_max is therefore only accurate in absolute terms; a one-sided Jacobi SVD would also get those
+  right relative to their own size.
 - `svd` always returns orthonormal `u` and `v`, rank-deficient matrices included.
 - Every sum goes through `dot`, which keeps 16 partial sums in a fixed array of lanes. Results are
   deterministic for a given build: the summation order is fixed in the source, not chosen by the
@@ -89,26 +109,40 @@ first, until `goose fetch --update`.
 
 ## Building for speed
 
-`goose build` compiles with plain `/O2` (MSVC) or `-O2`, which targets baseline x86-64 (SSE2). For
-production, enable the CPU's vector units. With MSVC, set `CL` before building:
+`goose build` uses the C compiler it finds. On Windows with Visual Studio 2026 that is clang-cl,
+ahead of MSVC; `GOOSE_CC` or `--cc` picks another. It compiles with plain `/O2` or `-O2`, which
+targets baseline x86-64 (SSE2).
 
-```bash
-CL="/arch:AVX2 /fp:contract" goose build yourprogram.goose
-```
+- **Under clang:** `linalg`'s hot kernels are `simd fn`s. Goose builds each for baseline x86-64
+  and again for AVX2 and AVX-512, and picks the widest the CPU has at run time. A plain
+  `goose build` therefore ran within 2% of a build with AVX2 throughout (6% for `cholesky`), and
+  the matrix multiply ran at twice the speed it gets without `simd`.
+- **Under MSVC:** `simd` does nothing (Goose builds one version), so enable AVX2 yourself before
+  building:
 
-With gcc or clang, the equivalent flags are `-march=x86-64-v3 -ffp-contract=fast`.
+  ```bash
+  CL="/arch:AVX2" goose build yourprogram.goose
+  ```
 
-Don't use `/fp:fast` or `-ffast-math`. They gain nothing here, because `linalg`'s own kernels
-already vectorize their sums. And they break IEEE semantics: under `/fp:fast`, MSVC folds
-`1.0 / 0.0` to `1e300`, and checks for NaN and infinity stop working. One check in the test
-suite fails under it. It also ends `linalg.parallel`'s bit-for-bit match with the serial results:
-fast-math lets the compiler build the worker threads' copy of the kernel with a different
-summation order.
+  With gcc or clang outside clang-cl, the equivalent is `-march=x86-64-v3`.
+- **Choice of compiler:** on the test machine, clang-cl 22 with `/arch:AVX2` ran most of
+  `linalg` 15–20% faster than MSVC 19.51 with `/arch:AVX2`, and `matvec` twice as fast. The
+  matrix multiply ran at the same speed under both.
+- **No FMA, whatever the flags:** Goose turns floating-point contraction off in the C it
+  generates, so that a program's results don't depend on its compiler. So no build uses fused
+  multiply-adds, and `/fp:contract` or `-ffp-contract=fast` change nothing.
+
+Don't use `/fp:fast` or `-ffast-math`. Under clang they do bring FMA back. The disassembly
+showed 2,124 vector FMA instructions against none, and the matrix multiply took 26% less time at
+n = 400, at 69 GFLOP/s, ahead of OpenBLAS's 62. But they break IEEE semantics: under `/fp:fast`, MSVC folds `1.0 / 0.0` to
+`1e300`, and checks for NaN and infinity stop working. One check in the test suite fails under
+it. It also ends `linalg.parallel`'s bit-for-bit match with the serial results: fast-math lets
+the compiler build the worker threads' copy of the kernel with a different summation order.
 
 ## Multithreading
 
 ```goose
-import linalg from "guillochon/goose-linalg@v0.2.2";
+import linalg from "guillochon/goose-linalg@v0.3.0";
 import linalg.parallel;
 
 fn main() {
@@ -204,7 +238,7 @@ race.
 | Memory | 32 GB DDR5-6200 (2 × 16 GB Corsair Vengeance, CMK32GX5M2B6200C36) |
 | Board | ASUS ROG STRIX Z690-I GAMING WIFI |
 | OS | Windows 11 Home 23H2 (build 22631), High performance power plan |
-| Goose | v2026.3, compiled by MSVC 19.44 (Visual Studio 2022, toolset 14.44) with `/O2 /arch:AVX2 /fp:contract` |
+| Goose | v2026.3, compiled by clang-cl 22.1.3 (Visual Studio 2026) with `/O2 /arch:AVX2`. A plain `goose build`, where `simd` picks the AVX2 kernels at run time, measured within 2% (6% for `cholesky`). |
 | Reference | NumPy 2.2.6 on Python 3.12.0, linked to OpenBLAS 0.3.29 (`DYNAMIC_ARCH`, which picks AVX2/FMA kernels on this CPU) |
 | Pinning | Single-threaded runs on logical CPU 4, a performance core. Multithreaded runs use 6 threads pinned to logical CPUs 0, 2, 4, 6, 8 and 10, one per performance core. Unpinned, or on all 16 logical CPUs, OpenBLAS's LU ran more than 100× slower than on one thread. |
 
@@ -219,17 +253,27 @@ absolute times at n = 400:
 
 | | matmul | solve | inverse | cholesky | qr | eigh | svd |
 |---|---|---|---|---|---|---|---|
-| Goose | 2.6 ms | 1.7 ms | 4.5 ms | 1.1 ms | 6.9 ms | 22 ms | 48 ms |
-| OpenBLAS | 2.0 ms | 1.3 ms | 4.4 ms | 1.1 ms | 6.1 ms | 11 ms | 22 ms |
-| ratio | 1.25× | 1.3× | 1.0× | 1.0× | 1.1× | 1.9× | 2.1× |
+| Goose | 2.5 ms | 1.27 ms | 3.7 ms | 1.0 ms | 5.5 ms | 11.9 ms | 24.6 ms |
+| OpenBLAS | 2.0 ms | 1.28 ms | 4.4 ms | 1.1 ms | 6.1 ms | 11.3 ms | 22.3 ms |
+| ratio | 1.23× | 0.99× | 0.82× | 0.93× | 0.89× | 1.05× | 1.10× |
 
-`matmul` runs at 50 GFLOP/s against OpenBLAS's 62. At n = 50, `matvec`, `solve`, `det`,
-`inverse`, `cholesky` and `eigh` are as fast as NumPy or faster.
+At n = 400:
+- `solve`, `det` and `matvec` match OpenBLAS, and `inverse`, `cholesky` and `qr` beat it.
+- `matmul` runs at 51 GFLOP/s against OpenBLAS's 62. It is the furthest behind, at 1.2–1.4× at
+  every size, because Goose's C never uses FMA (see Building for speed).
+- The middle sizes are the next gap: at n = 100–200, `cholesky` is 1.3–1.55× behind, and `solve`
+  and `det` 1.15×.
+
+At n = 50, almost everything is faster than NumPy, whose call overhead dominates there.
+
+At n = 800, `eigh` took 87 ms against OpenBLAS's 70, and `svd` 172 ms against 166. With QR
+iteration instead of divide and conquer, `svd` took 436 ms.
 
 What makes the kernels fast:
 - Inner loops run over row slices with `assert`ed lengths, so Goose drops their bounds checks.
 - Update loops (`ri[j] -= f * rk[j]`) then vectorize as written.
-- Sums use `dot`'s lane array, the one form MSVC vectorizes without fast-math.
+- Sums use `dot`'s lane array, the one form the C compilers vectorize without fast-math.
+- The kernels are `simd fn`s, so clang builds AVX2 and AVX-512 versions of them.
 - One matrix-multiply kernel, `gemm_acc`, works on blocks of matrices. It's register-blocked four
   rows of the result by four steps of the inner dimension. `matmul` is a single call to it, and
   the blocked LU, Cholesky, QR and the eigenvector/singular-vector bases do most of their work in
@@ -237,9 +281,9 @@ What makes the kernels fast:
 - Large products go through the right-hand operand in cache blocks of 256 × 512, so a product
   bigger than the caches runs nearly as fast as one that fits.
 
-`eigh` and `svd` remain about 2× behind. Their reductions to tridiagonal/bidiagonal form are
-still one reflector at a time, and their QR iterations spend most of their time on plane
-rotations. LAPACK replaces both with blocked reductions and divide-and-conquer solvers.
+`eigh` and `svd` follow LAPACK's divide-and-conquer drivers past 64 rows or columns (see
+Algorithms). Before that, their QL and QR iterations spent over half their time on plane rotations,
+and both ran about 2× behind OpenBLAS.
 
 ### Multithreaded
 
@@ -249,25 +293,24 @@ Times at n = 1600, and the speedups on 6 threads over 1:
 
 | n = 1600 | matmul | det | solve | solve_matrix | inverse | cholesky |
 |---|---|---|---|---|---|---|
-| Goose, 1 thread | 194 ms | 74 ms | 79 ms | 287 ms | 237 ms | 50 ms |
-| Goose, 6 threads | 77 ms | 51 ms | 53 ms | 131 ms | 128 ms | 49 ms |
-| speedup | **2.5×** | 1.5× | 1.5× | **2.2×** | **1.9×** | 1.0× |
-| OpenBLAS, 1 thread | 120 ms | 56 ms | 54 ms | 200 ms | 200 ms | 40 ms |
-| OpenBLAS, 6 threads | 24 ms | 19 ms | 54 ms | 64 ms | 58 ms | 26 ms |
-| speedup | 5.0× | 3.0× | 1.0× | 3.1× | 3.5× | 1.5× |
+| Goose, 1 thread | 183 ms | 68 ms | 70 ms | 256 ms | 221 ms | 46 ms |
+| Goose, 6 threads | 68 ms | 45 ms | 45 ms | 121 ms | 119 ms | 46 ms |
+| speedup | **2.7×** | 1.5× | 1.5× | **2.1×** | **1.9×** | 1.0× |
+| OpenBLAS, 1 thread | 120 ms | 53 ms | 54 ms | 197 ms | 193 ms | 40 ms |
+| OpenBLAS, 6 threads | 24 ms | 18 ms | 54 ms | 60 ms | 57 ms | 26 ms |
+| speedup | 5.1× | 2.9× | 1.0× | 3.3× | 3.4× | 1.5× |
 
-On one thread Goose is 1.2–1.6× behind OpenBLAS at this size. On six it is 1.9–3.3× behind,
-because OpenBLAS's threads share the matrix in memory while Goose's copy what they work on. The
-exception is `solve`, where the two are level: OpenBLAS doesn't speed it up on more threads at this
-size.
+On one thread Goose is 1.15–1.5× behind OpenBLAS at this size, more than at n = 400, where the
+matrices fit in cache. On six it is 1.7–2.9× behind, because OpenBLAS's threads share the matrix
+in memory while Goose's copy what they work on. The exception is `solve`, where Goose is 16%
+ahead: OpenBLAS doesn't speed it up on more threads at this size.
 
-The owner-computes triangular solves took `solve_matrix` from 1.5× to 2.2× here and `inverse`
-from 1.4× to 1.9×. That closed their gap to OpenBLAS from 2.6× and 3.0× to 2.0× and 2.2×.
-`matmul`'s code hasn't changed since the previous run; this run was about 4% slower on one thread
-too, so treat differences of a few percent between runs as noise.
-
-At n = 800, `matmul` gains 1.8×, `solve_matrix` 1.34× and `inverse` 1.23×. The rest run at
+At n = 800, `matmul` gains 1.8×, `solve_matrix` 1.31× and `inverse` 1.25×. The rest run at
 serial speed.
+
+One run of OpenBLAS on six threads stalled despite the pinning (its `det` took 332 ms at
+n = 1600 instead of 18), as unpinned runs do. Two repeats were normal, and the table uses the
+second.
 
 ### Reproducing
 
@@ -294,13 +337,25 @@ change the pinning for another machine.
 goose test/test_linalg.goose
 ```
 
-The suite runs 1,230 checks and exits 1 on any failure. It has these kinds of checks:
+The suite runs 1,339 checks and exits 1 on any failure. It has these kinds of checks:
 - **Exact cases worked by hand:** the Hilbert inverse, a textbook Cholesky factor, Fibonacci
   through `power`, the path-graph Laplacian spectrum, and Wilkinson's W₂₁⁺, whose eigenvalues come in
   pairs that agree to about 10⁻¹⁴.
 - **SVD edge cases:** matrices that force the bidiagonal QR to split and to deflate, graded
   singular values from 1 down to 10⁻¹⁵, and clustered singular values that only converge with
   the Wilkinson shift.
+- **Divide and conquer:** `eigh` past 64 rows and `svd` past 64 columns, on spectra that make
+  the merges deflate, rotate close pairs apart, and solve secular equations whose roots crowd
+  their poles:
+  - Wilkinson's W₁₀₁⁺ and W₂₀₁⁺;
+  - 65 or 55 equal values, values all within 2×10⁻¹⁰, and spectra graded down to 10⁻¹⁵;
+  - rank one and rank 55;
+  - zeros on the tridiagonal or bidiagonal;
+  - scaling by 10^±150;
+  - a 420 × 390 SVD, which takes the blocked bidiagonalization.
+
+  Each checks the residual, orthogonality and the known values within 10 n ε. The worst
+  measured was 3 n ε.
 - **Blocked sizes:** n = 33, 64, 97 and 300, past the 32-column panels and the 256-column
   outer blocks, for every blocked routine, with singular and indefinite matrices whose trouble
   lies past the first block; and a product past the matrix-multiply cache blocks.
@@ -322,18 +377,20 @@ checked a second time with owner-computes factorization and solves switched on f
 for every thread to get a task. After those calls, every queue must be empty: a message left
 behind would be read by the next call.
 
-Both suites pass as native MSVC builds, plain and with production flags, and the serial one also
-in-process. They were also mutation-tested: 99 bugs were planted one at a time, 78 in the library
+Both suites pass as native builds with clang-cl 22 and MSVC 19.51, plain and with `/arch:AVX2`,
+and the serial one also in-process. They were also mutation-tested: 99 bugs were planted one at a time, 78 in the library
 and 21 in the parallel module, and every one was caught. They covered `gemm_acc` and its cache
 blocks, the two-level LU, solves and Cholesky, the compact-WY helpers, every branch of the
 Golub-Kahan iteration, `tred2`/`tql2`, the `dot` lanes, and, in the parallel module, the row and
-column shares, copying results back, the cost model and the pool. The owner-computes LU and
-triangular solves and the column-major LU panel came later, and haven't been mutation-tested yet.
+column shares, copying results back, the cost model and the pool. Several later additions
+haven't been mutation-tested yet: the owner-computes LU and triangular solves, the column-major
+LU panel, the divide-and-conquer `eigh` and `svd`, and their blocked reductions.
 
 `examples/fit.goose` fits a polynomial by least squares and finds a point cloud's principal axes.
 
 ## License
 
-Apache-2.0, the same license as Goose itself (see `LICENSE`). The symmetric eigensolver and the SVD
-are ports of the public-domain JAMA library's versions of EISPACK's `tred2`/`tql2` and LINPACK's
-`dsvdc`.
+Apache-2.0, the same license as Goose itself (see `LICENSE`). The small-size symmetric eigensolver
+and SVD are ports of the public-domain JAMA library's versions of EISPACK's `tred2`/`tql2` and
+LINPACK's `dsvdc`. The divide-and-conquer solvers and blocked reductions follow the algorithms of
+LAPACK's `dsyevd`, `dstedc`, `dgesdd`, `dbdsdc`, `dsytrd` and `dgebrd`, written afresh in Goose.

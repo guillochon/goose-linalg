@@ -1,4 +1,6 @@
-# Builds the Goose benchmarks with MSVC and runs them, and the OpenBLAS
+# Builds the Goose benchmarks with the C compiler goose finds (clang-cl from
+# Visual Studio 2026 on the test machine; GOOSE_CC picks another) and runs
+# them, and the OpenBLAS
 # benchmark, pinned to performance cores so that a hybrid CPU (P- and
 # E-cores) does not move them around mid-run.
 #
@@ -36,9 +38,9 @@ function Build($src, $exe, $flags) {
 $one = [long](1 -shl $Core)
 if ($Only -eq "" -or $Only -eq "goose") {
     $configs = [ordered]@{
-        "base" = "";                            # what `goose build` does: /O2
-        "avx2" = "/arch:AVX2 /fp:contract";     # production: AVX2 + FMA, IEEE semantics kept
-        "fast" = "/arch:AVX2 /fp:fast";         # reference only: breaks inf/NaN semantics
+        "base" = "";                            # what `goose build` does: /O2, and AVX2 versions of simd fns under clang
+        "avx2" = "/arch:AVX2";                  # production: AVX2 throughout, IEEE semantics kept (Goose turns off contraction, so no FMA)
+        "fast" = "/arch:AVX2 /fp:fast";         # reference only: FMA under clang, but breaks inf/NaN semantics
     }
     foreach ($name in $configs.Keys) {
         Build "$here\bench.goose" "$here\bench_$name.exe" $configs[$name]
@@ -53,7 +55,7 @@ if ($Only -eq "" -or $Only -eq "lapack") {
     Write-Output "openblas 1 thread done"
 }
 if ($Only -eq "" -or $Only -eq "mt") {
-    Build "$here\bench_mt.goose" "$here\bench_mt.exe" "/arch:AVX2 /fp:contract"
+    Build "$here\bench_mt.goose" "$here\bench_mt.exe" "/arch:AVX2"
     Run-Pinned "$here\bench_mt.exe" @("bench_goose_mt.csv", "$Threads") "$here\log_mt.txt" $ThreadMask
     Write-Output "goose multithreaded done"
     $env:BENCH_SIZES = "400,800,1600"

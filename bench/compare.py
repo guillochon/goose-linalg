@@ -3,7 +3,7 @@
     python compare.py [--with-prev]      (in this directory, after run_pinned.ps1)
 
 The headline comparison is production against production: Goose built with
-/arch:AVX2 /fp:contract (bench_goose_avx2.csv) against single-threaded
+/arch:AVX2 (bench_goose_avx2.csv) against single-threaded
 OpenBLAS (bench_lapack_1t.csv), both pinned to one P-core. Other runs are
 shown when their CSVs exist: bench_goose_prev_avx2.csv (an earlier version,
 same flags; in the table always, in the chart only with --with-prev),
@@ -77,7 +77,7 @@ for s, (name, data) in enumerate(series):
 ax[1].set(yscale="log", ylabel="ms (log)", title=f"Absolute time at n = {n}")
 ax[1].set_xticks(range(len(ops)), ops, rotation=30)
 ax[1].legend(fontsize=8)
-fig.suptitle("Goose linalg (MSVC /O2 /arch:AVX2 /fp:contract, 1 thread) vs NumPy + OpenBLAS 0.3.29, "
+fig.suptitle("Goose linalg (clang-cl 22 /O2 /arch:AVX2, 1 thread) vs NumPy + OpenBLAS 0.3.29, "
              "i5-12600K, pinned to one P-core", fontsize=10)
 fig.tight_layout()
 fig.savefig("compare.png", dpi=120)
